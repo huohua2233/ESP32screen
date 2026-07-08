@@ -80,7 +80,13 @@ lv_fs_res_t lv_file_read(const char *path)
     lv_tell(&fd);
     lv_fs_seek(&fd,0,LV_FS_SEEK_SET);
     lv_tell(&fd);
-    res = lv_fs_read(&fd, lv_flie.rbuf, FILE_SEZE, &rsize);
+    memset(lv_flie.rbuf, 0, sizeof(lv_flie.rbuf));
+    res = lv_fs_read(&fd, lv_flie.rbuf, FILE_SEZE - 1, &rsize);
+    if (rsize >= FILE_SEZE)
+    {
+        rsize = FILE_SEZE - 1;
+    }
+    lv_flie.rbuf[rsize] = '\0';
 
     if (res != LV_FS_RES_OK)
     {

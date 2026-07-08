@@ -51,6 +51,8 @@ static uint8_t video_dir_changed = 0;
 static uint8_t video_img_ready = 0;
 static uint32_t video_img_w = 0;
 static uint32_t video_img_h = 0;
+static uint32_t video_buf_w = 0;
+static uint32_t video_buf_h = 0;
 static lv_obj_t *video_back_btn = NULL;
 static uint8_t video_closing = 0;
 static volatile video_stat_t video_pending_key = VIDEO_NULL;
@@ -899,7 +901,6 @@ void video(void *pvParameters)
                     goto video_file_cleanup;
                 }
 
-                esptim_int_init( 1, g_avix.SecPerFrame);
                 offset = avi_srarch_id(pbuf, AVI_MAX_FRAME_SIZE, "movi");   /* 寻找movi ID */
                 if (avi_get_streaminfo(pbuf + offset + 4) != 0)             /* 获取流信息 */
                 {
@@ -922,18 +923,26 @@ void video(void *pvParameters)
                 }
                 mjpeg_open = 1;
 
-                if (video_buf != NULL)
-                {
-                    mjpegdec_video_free();
-                }
                 {
                     /* 定义图像的宽高 */
                     Windows_Width = g_avix.Width;
                     Windows_Height = g_avix.Height;
 
-                    if (video_buf == NULL)
+                    if ((video_buf == NULL) || (video_buf_w != g_avix.Width) || (video_buf_h != g_avix.Height))
                     {
+                        if (video_buf != NULL)
+                        {
+                            mjpegdec_video_free();
+                            video_buf_w = 0;
+                            video_buf_h = 0;
+                        }
+
                         mjpegdec_malloc();
+                        if (video_buf != NULL)
+                        {
+                            video_buf_w = g_avix.Width;
+                            video_buf_h = g_avix.Height;
+                        }
                     }
                 }
 
@@ -1004,7 +1013,6 @@ void video(void *pvParameters)
                             break;
                         }
 
-                        frameup = 0;
                     }
                     else
                     {
@@ -1070,11 +1078,7 @@ void video(void *pvParameters)
                 key = 0;
                 res = FR_OK;
 video_file_cleanup:
-                if (esp_tim_handle != NULL)
-                {
-                    esp_timer_delete(esp_tim_handle);
-                    esp_tim_handle = NULL;
-                }
+                esptim_int_deinit();
                 if (mjpeg_open)
                 {
                     mjpegdec_free();
@@ -1101,11 +1105,7 @@ video_file_cleanup:
         video_sd_lost();
     }
 
-    if (esp_tim_handle != NULL)
-    {
-        esp_timer_delete(esp_tim_handle);
-        esp_tim_handle = NULL;
-    }
+    esptim_int_deinit();
 
     if (mjpeg_open)
     {
@@ -1354,16 +1354,14 @@ void lv_video_del(void)
     }
     SD_CS(1);
 
-    if (esp_tim_handle != NULL)
-    {
-        esp_timer_delete(esp_tim_handle);
-        esp_tim_handle = NULL;
-    }
-    mjpegdec_free();                                                /* 删除一个定时器实例 */
+    esptim_int_deinit();
+    mjpegdec_free();
 
     if (video_buf != NULL)
     {
         mjpegdec_video_free();
+        video_buf_w = 0;
+        video_buf_h = 0;
     }
 
     if ((framebuf != NULL))

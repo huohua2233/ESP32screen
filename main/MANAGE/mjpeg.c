@@ -192,8 +192,8 @@
      jpeg_mem_src(cinfo, buf, bsize);
      jpeg_read_header(cinfo, TRUE);
  
-     jpeg_start_decompress(cinfo); 
- 
+     jpeg_start_decompress(cinfo);
+
      row_stride = cinfo->output_width * cinfo->output_components;
  
      buffer = (*cinfo->mem->alloc_sarray)
