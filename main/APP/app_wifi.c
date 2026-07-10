@@ -12,6 +12,8 @@
 
 #include "app_wifi.h"
 #include "esp_wifi.h"
+#include "esp_wifi_default.h"
+#include "esp_netif.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
@@ -41,11 +43,16 @@ extern lv_obj_t *back_btn;                   /* 外部声明的返回按钮 */
 static lv_obj_t *kb = NULL;                     /* 键盘对象 */
 static volatile bool wifi_ui_active = false;    /* WiFi界面激活状态标志 */
 static bool wifi_initialized = false;           /* WiFi驱动初始化标志 */
+static bool wifi_storage_configured = false;
 static bool event_handlers_registered = false;  /* 事件处理器注册标志 */
-static bool wifi_back_event_registered = false;
 static bool wifi_started = false;
 static volatile bool wifi_scan_running = false;
 static volatile bool wifi_connect_wait_running = false;
+static volatile uint32_t wifi_scan_requested_generation = 0;
+static volatile uint32_t wifi_scan_running_generation = 0;
+static volatile uint32_t wifi_connect_wait_generation = 0;
+static uint32_t wifi_conn_box_generation = 0;
+static esp_netif_t *wifi_sta_netif = NULL;
 static lv_obj_t *status_label = NULL;           /* 连接状态标签 */
 static TimerHandle_t status_timer = NULL;       /* 定时器句柄 */
 static bool status_shown = false;               /* 状态信息是否已显示标志 */
@@ -96,12 +103,16 @@ typedef struct {
     char password[MAX_PASSWORD_LEN + 1];
     wifi_auth_mode_t authmode;
     uint32_t generation;
+    uint32_t task_generation;
+    uint32_t conn_box_generation;
 } wifi_connect_wait_t;
 
 typedef struct {
     bool success;
     char ssid[33];
     uint32_t generation;
+    uint32_t task_generation;
+    uint32_t conn_box_generation;
 } wifi_connect_result_t;
 
 typedef struct {
@@ -133,10 +144,9 @@ static void ta_event_cb(lv_event_t *e);
 static void scan_btn_event(lv_event_t *e);
 static const void* get_wifi_icon(int rssi);                     
 static void async_update_status_label_cb(void *arg);
-static void back_button_event(lv_event_t *e);
 static bool wifi_saved_find_password(const char *ssid, char *password, size_t password_size);
 static bool wifi_saved_remember(const char *ssid, const char *password, wifi_auth_mode_t authmode);
-void wifi_module_init(void);
+static esp_err_t wifi_module_init(void);
 
 /**
  * @brief       AP信息释放事件
@@ -159,6 +169,15 @@ static void conn_box_delete_event(lv_event_t *e)
 
     if (target == wifi_ui.conn_box)
     {
+        if (wifi_ui.pwd_ta != NULL && lv_obj_is_valid(wifi_ui.pwd_ta))
+        {
+            lv_obj_remove_event_cb(wifi_ui.pwd_ta, ta_event_cb);
+        }
+        if (kb != NULL && lv_obj_is_valid(kb))
+        {
+            lv_keyboard_set_textarea(kb, NULL);
+            lv_obj_add_flag(kb, LV_OBJ_FLAG_HIDDEN);
+        }
         wifi_ui.conn_box = NULL;
         wifi_ui.pwd_ta = NULL;
     }
@@ -301,12 +320,23 @@ static void wifi_scan_handler(void)
 
 static bool wifi_start_sta(void)
 {
-    wifi_module_init();
-    esp_wifi_set_mode(WIFI_MODE_STA);
+    esp_err_t ret = wifi_module_init();
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "WiFi init failed: %s", esp_err_to_name(ret));
+        return false;
+    }
+
+    ret = esp_wifi_set_mode(WIFI_MODE_STA);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "WiFi mode failed: %s", esp_err_to_name(ret));
+        return false;
+    }
 
     if (!wifi_started)
     {
-        esp_err_t ret = esp_wifi_start();
+        ret = esp_wifi_start();
         if (ret != ESP_OK)
         {
             ESP_LOGE(TAG, "WiFi start failed: %s", esp_err_to_name(ret));
@@ -320,8 +350,17 @@ static bool wifi_start_sta(void)
 
 static bool wifi_start_scan(void)
 {
+    if (!wifi_ui_active)
+    {
+        return false;
+    }
+
+    uint32_t generation = wifi_ui_generation;
+    wifi_scan_requested_generation = generation;
+
     if (wifi_scan_running)
     {
+        async_update_status_label("扫描WIFI...");
         return true;
     }
 
@@ -331,19 +370,37 @@ static bool wifi_start_scan(void)
         return false;
     }
 
+    wifi_scan_result_t *result = calloc(1, sizeof(wifi_scan_result_t));
+    if (result == NULL)
+    {
+        async_update_status_label("WiFi扫描失败");
+        return false;
+    }
+    result->generation = generation;
+
     wifi_scan_running = true;
+    wifi_scan_running_generation = generation;
     async_update_status_label("扫描WIFI...");
 
     BaseType_t ret = xTaskCreatePinnedToCore(wifi_scan_task,
                                              "wifi_scan",
                                              WIFI_WORK_TASK_STACK,
-                                             (void *)(uintptr_t)wifi_ui_generation,
+                                             result,
                                              WIFI_WORK_TASK_PRIORITY,
                                              NULL,
                                              0);
     if (ret != pdPASS)
     {
-        wifi_scan_running = false;
+        free(result);
+        if (wifi_scan_running_generation == generation)
+        {
+            wifi_scan_running = false;
+            wifi_scan_running_generation = 0;
+        }
+        if (wifi_scan_requested_generation == generation)
+        {
+            wifi_scan_requested_generation = 0;
+        }
         async_update_status_label("WiFi扫描失败");
         return false;
     }
@@ -353,22 +410,19 @@ static bool wifi_start_scan(void)
 
 static void wifi_scan_task(void *arg)
 {
-    uint32_t generation = (uint32_t)(uintptr_t)arg;
-
-    wifi_scan_result_t *result = calloc(1, sizeof(wifi_scan_result_t));
+    wifi_scan_result_t *result = (wifi_scan_result_t *)arg;
     if (result == NULL)
     {
-        wifi_scan_running = false;
         vTaskDelete(NULL);
         return;
     }
 
-    result->generation = generation;
+    uint32_t generation = result->generation;
     result->err = esp_wifi_scan_start(NULL, true);
     if (result->err == ESP_OK)
     {
-        esp_wifi_scan_get_ap_num(&result->ap_count);
-        if (result->ap_count > 0)
+        result->err = esp_wifi_scan_get_ap_num(&result->ap_count);
+        if (result->err == ESP_OK && result->ap_count > 0)
         {
             result->ap_list = malloc(sizeof(wifi_ap_record_t) * result->ap_count);
             if (result->ap_list == NULL)
@@ -386,8 +440,35 @@ static void wifi_scan_task(void *arg)
     if (lv_async_call(wifi_scan_result_cb, result) != LV_RES_OK)
     {
         free(result->ap_list);
-        free(result);
-        wifi_scan_running = false;
+        result->ap_list = NULL;
+        result->ap_count = 0;
+        result->err = ESP_ERR_NO_MEM;
+
+        if (lv_async_call(wifi_scan_result_cb, result) != LV_RES_OK)
+        {
+            free(result);
+
+            bool owns_scan = wifi_scan_running_generation == generation;
+            uint32_t requested_generation = wifi_scan_requested_generation;
+            if (owns_scan)
+            {
+                wifi_scan_running = false;
+                wifi_scan_running_generation = 0;
+            }
+
+            if (owns_scan &&
+                requested_generation != 0 &&
+                (requested_generation == generation ||
+                 (wifi_ui_active && requested_generation == wifi_ui_generation)) &&
+                wifi_scan_requested_generation == requested_generation)
+            {
+                wifi_scan_requested_generation = 0;
+                if (wifi_ui_active && requested_generation == wifi_ui_generation)
+                {
+                    async_update_status_label_gen("WiFi扫描失败", requested_generation);
+                }
+            }
+        }
     }
 
     vTaskDelete(NULL);
@@ -396,19 +477,41 @@ static void wifi_scan_task(void *arg)
 static void wifi_scan_result_cb(void *arg)
 {
     wifi_scan_result_t *result = (wifi_scan_result_t *)arg;
-    wifi_scan_running = false;
 
     if (result == NULL)
     {
         return;
     }
 
-    if (!wifi_ui_active || wifi_ui.list == NULL || !lv_obj_is_valid(wifi_ui.list) || result->generation != wifi_ui_generation)
+    bool owns_scan = wifi_scan_running_generation == result->generation;
+    if (owns_scan)
+    {
+        wifi_scan_running = false;
+        wifi_scan_running_generation = 0;
+    }
+
+    bool restart_requested = owns_scan &&
+                             wifi_ui_active &&
+                             wifi_scan_requested_generation != 0 &&
+                             wifi_scan_requested_generation == wifi_ui_generation &&
+                             wifi_scan_requested_generation != result->generation;
+
+    if (!wifi_ui_active ||
+        wifi_ui.list == NULL ||
+        !lv_obj_is_valid(wifi_ui.list) ||
+        result->generation != wifi_ui_generation ||
+        wifi_scan_requested_generation != result->generation)
     {
         free(result->ap_list);
         free(result);
+        if (restart_requested)
+        {
+            wifi_start_scan();
+        }
         return;
     }
+
+    wifi_scan_requested_generation = 0;
 
     lv_obj_clean(wifi_ui.list);
 
@@ -464,51 +567,149 @@ static void wifi_scan_result_cb(void *arg)
     free(result);
 }
 
+static uint32_t wifi_next_connect_wait_generation(void)
+{
+    uint32_t generation = wifi_connect_wait_generation + 1;
+    if (generation == 0)
+    {
+        generation = 1;
+    }
+    wifi_connect_wait_generation = generation;
+    return generation;
+}
+
+static bool wifi_connect_wait_is_current(const wifi_connect_wait_t *wait)
+{
+    return wait != NULL &&
+           wifi_connect_wait_running &&
+           wifi_ui_active &&
+           wait->generation == wifi_ui_generation &&
+           wait->task_generation == wifi_connect_wait_generation;
+}
+
 static void wifi_connect_wait_task(void *arg)
 {
     wifi_connect_wait_t *wait = (wifi_connect_wait_t *)arg;
-    EventBits_t bits = 0;
 
     if (wait == NULL)
     {
-        wifi_connect_wait_running = false;
         vTaskDelete(NULL);
         return;
     }
 
-    if (wifi_event_group)
+    TickType_t start_tick = xTaskGetTickCount();
+    TickType_t timeout_ticks = pdMS_TO_TICKS(WIFI_CONNECT_TIMEOUT_MS);
+    TickType_t slice_ticks = pdMS_TO_TICKS(100);
+    if (slice_ticks == 0)
     {
-        bits = xEventGroupWaitBits(wifi_event_group,
-                                   WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
-                                   pdFALSE,
-                                   pdFALSE,
-                                   pdMS_TO_TICKS(WIFI_CONNECT_TIMEOUT_MS));
+        slice_ticks = 1;
     }
 
-    bool success = (bits & WIFI_CONNECTED_BIT) != 0;
-    if (success)
+    bool success = false;
+    while (wifi_connect_wait_is_current(wait))
+    {
+        TickType_t elapsed = xTaskGetTickCount() - start_tick;
+        if (elapsed >= timeout_ticks)
+        {
+            break;
+        }
+
+        TickType_t wait_ticks = timeout_ticks - elapsed;
+        if (wait_ticks > slice_ticks)
+        {
+            wait_ticks = slice_ticks;
+        }
+
+        EventBits_t bits = 0;
+        if (wifi_event_group != NULL)
+        {
+            bits = xEventGroupWaitBits(wifi_event_group,
+                                       WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+                                       pdFALSE,
+                                       pdFALSE,
+                                       wait_ticks);
+        }
+        else
+        {
+            vTaskDelay(wait_ticks);
+        }
+
+        if (!wifi_connect_wait_is_current(wait))
+        {
+            break;
+        }
+        if ((bits & WIFI_CONNECTED_BIT) != 0)
+        {
+            success = true;
+            break;
+        }
+        if ((bits & WIFI_FAIL_BIT) != 0)
+        {
+            break;
+        }
+    }
+
+    if (!wifi_connect_wait_is_current(wait))
+    {
+        free(wait);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    if (success && wifi_connect_wait_is_current(wait))
     {
         wifi_saved_remember(wait->ssid, wait->password, wait->authmode);
     }
 
-    wifi_connect_result_t *result = calloc(1, sizeof(wifi_connect_result_t));
-    if (result != NULL)
+    if (!wifi_connect_wait_is_current(wait))
     {
-        result->success = success;
-        result->generation = wait->generation;
-        strncpy(result->ssid, wait->ssid, sizeof(result->ssid) - 1);
-        if (lv_async_call(wifi_connect_result_cb, result) != LV_RES_OK)
+        free(wait);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    wifi_connect_result_t result_data = {
+        .success = success,
+        .generation = wait->generation,
+        .task_generation = wait->task_generation,
+        .conn_box_generation = wait->conn_box_generation,
+    };
+    strncpy(result_data.ssid, wait->ssid, sizeof(result_data.ssid) - 1);
+    free(wait);
+
+    bool result_queued = false;
+    for (int attempt = 0; attempt < 3; attempt++)
+    {
+        if (!wifi_ui_active ||
+            result_data.generation != wifi_ui_generation ||
+            result_data.task_generation != wifi_connect_wait_generation)
         {
+            break;
+        }
+
+        wifi_connect_result_t *result = malloc(sizeof(*result));
+        if (result != NULL)
+        {
+            memcpy(result, &result_data, sizeof(*result));
+            if (lv_async_call(wifi_connect_result_cb, result) == LV_RES_OK)
+            {
+                result_queued = true;
+                break;
+            }
             free(result);
-            wifi_connect_wait_running = false;
+        }
+
+        if (attempt < 2)
+        {
+            vTaskDelay(1);
         }
     }
-    else
+
+    if (!result_queued && wifi_connect_wait_generation == result_data.task_generation)
     {
         wifi_connect_wait_running = false;
     }
 
-    free(wait);
     vTaskDelete(NULL);
 }
 
@@ -516,10 +717,17 @@ static void wifi_connect_result_cb(void *arg)
 {
     wifi_connect_result_t *result = (wifi_connect_result_t *)arg;
     bool is_current = false;
+    bool owns_wait = false;
+    bool owns_conn_box = false;
 
     if (result != NULL)
     {
-        is_current = wifi_ui_active && result->generation == wifi_ui_generation;
+        owns_wait = result->task_generation == wifi_connect_wait_generation;
+        owns_conn_box = result->conn_box_generation == wifi_conn_box_generation;
+        is_current = owns_wait &&
+                     wifi_connect_wait_running &&
+                     wifi_ui_active &&
+                     result->generation == wifi_ui_generation;
         if (is_current)
         {
             show_connect_result(result->success, result->ssid);
@@ -527,12 +735,15 @@ static void wifi_connect_result_cb(void *arg)
         free(result);
     }
 
-    if (is_current && wifi_ui.conn_box && lv_obj_is_valid(wifi_ui.conn_box))
+    if (is_current && owns_conn_box && wifi_ui.conn_box && lv_obj_is_valid(wifi_ui.conn_box))
     {
         lv_msgbox_close(wifi_ui.conn_box);
     }
 
-    wifi_connect_wait_running = false;
+    if (owns_wait)
+    {
+        wifi_connect_wait_running = false;
+    }
 }
 
 /**
@@ -561,6 +772,11 @@ static void wifi_connect_event(lv_event_t *e)
         ESP_LOGE(TAG, "Create connection box failed");
         wifi_ui.pwd_ta = NULL;
         return;
+    }
+    wifi_conn_box_generation++;
+    if (wifi_conn_box_generation == 0)
+    {
+        wifi_conn_box_generation = 1;
     }
     lv_obj_add_event_cb(wifi_ui.conn_box, conn_box_delete_event, LV_EVENT_DELETE, NULL);
 	//wifi_ui.conn_box = lv_msgbox_create(lv_scr_act(), "输入密码", (const char *)ap->ssid, connect_btns, true);
@@ -630,6 +846,11 @@ static void conn_btn_event(lv_event_t *e)
     lv_obj_t *btnm = lv_event_get_target(e);                    /* 获取触发事件的按钮矩阵对象 */
     uint16_t btn_id = lv_btnmatrix_get_selected_btn(btnm);      /* 获取被点击按钮的ID */
     const char *txt = lv_btnmatrix_get_btn_text(btnm, btn_id);  /* 获取按钮文本 */
+
+    if (txt == NULL)
+    {
+        return;
+    }
     
     /* 检查是否点击了取消按钮 */
     if (strcmp(txt, "Connect") != 0) 
@@ -652,8 +873,17 @@ static void conn_btn_event(lv_event_t *e)
         return;
     }
 
+    if (wifi_ui.pwd_ta == NULL || !lv_obj_is_valid(wifi_ui.pwd_ta))
+    {
+        return;
+    }
+
     const char *pwd = lv_textarea_get_text(wifi_ui.pwd_ta);
-    if (!pwd || strlen(pwd) == 0) 
+    if (pwd == NULL)
+    {
+        pwd = "";
+    }
+    if (ap->authmode != WIFI_AUTH_OPEN && pwd[0] == '\0')
 	{               /* 空密码检查 */
         LV_LOG_WARN("No password provided");
         return;
@@ -670,6 +900,7 @@ static void conn_btn_event(lv_event_t *e)
     strncpy(wait->password, pwd, sizeof(wait->password) - 1);
     wait->authmode = ap->authmode;
     wait->generation = wifi_ui_generation;
+    wait->conn_box_generation = wifi_conn_box_generation;
 
     if (!wifi_start_sta())
     {
@@ -709,21 +940,11 @@ static void conn_btn_event(lv_event_t *e)
     {
         xEventGroupClearBits(wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
     }
-    
-    /* 发起连接请求 */
-    ret = esp_wifi_connect();
-    if (ret != ESP_OK) 
-	{
-        LV_LOG_ERROR("Connect failed: %s", esp_err_to_name(ret));
-        free(wait);
-        lv_msgbox_close(wifi_ui.conn_box);        /* 关闭消息弹窗 */
-        return;
-    }
 
     /* 更新连接状态提示 */
     lv_label_set_text(lv_msgbox_get_title(wifi_ui.conn_box), "Connecting...");
-    lv_obj_add_state(lv_msgbox_get_btns(wifi_ui.conn_box), LV_STATE_DISABLED);
 
+    wait->task_generation = wifi_next_connect_wait_generation();
     wifi_connect_wait_running = true;
     BaseType_t task_ret = xTaskCreatePinnedToCore(wifi_connect_wait_task,
                                                   "wifi_conn",
@@ -734,10 +955,24 @@ static void conn_btn_event(lv_event_t *e)
                                                   0);
     if (task_ret != pdPASS)
     {
-        wifi_connect_wait_running = false;
+        if (wifi_connect_wait_generation == wait->task_generation)
+        {
+            wifi_connect_wait_running = false;
+        }
         free(wait);
         show_connect_result(false, (const char *)ap->ssid);
         lv_msgbox_close(wifi_ui.conn_box);
+        return;
+    }
+
+    ret = esp_wifi_connect();
+    if (ret != ESP_OK)
+    {
+        LV_LOG_ERROR("Connect failed: %s", esp_err_to_name(ret));
+        if (wifi_event_group != NULL)
+        {
+            xEventGroupSetBits(wifi_event_group, WIFI_FAIL_BIT);
+        }
     }
     return;
 }
@@ -885,13 +1120,31 @@ static void ta_event_cb(lv_event_t *e)
     lv_obj_t *ta = lv_event_get_target(e);
     lv_event_code_t code = lv_event_get_code(e);
     static int original_y = 0;  /* 保存原始Y坐标 */
+
+    if (!wifi_ui_active || ta == NULL || !lv_obj_is_valid(ta))
+    {
+        return;
+    }
     
     if(code == LV_EVENT_FOCUSED) 
 	{
+        if (wifi_ui.conn_box == NULL || !lv_obj_is_valid(wifi_ui.conn_box))
+        {
+            return;
+        }
+
         /* 创建键盘并调整位置 */
-        if(kb == NULL) 
+        if (kb != NULL && !lv_obj_is_valid(kb))
+        {
+            kb = NULL;
+        }
+        if(kb == NULL)
 		{
             kb = lv_keyboard_create(lv_scr_act());
+            if (kb == NULL)
+            {
+                return;
+            }
             lv_obj_set_size(kb, 320, 160);
             lv_obj_set_style_radius(kb, 12, 0);
             lv_obj_set_style_bg_color(kb, lv_color_hex(0xEFEFF4), 0);
@@ -905,9 +1158,15 @@ static void ta_event_cb(lv_event_t *e)
     else if(code == LV_EVENT_DEFOCUSED) 
 	{
         /* 恢复原始位置并隐藏键盘 */
-        lv_obj_set_y(wifi_ui.conn_box, original_y);
-        lv_keyboard_set_textarea(kb, NULL);
-        lv_obj_add_flag(kb, LV_OBJ_FLAG_HIDDEN);
+        if (wifi_ui.conn_box != NULL && lv_obj_is_valid(wifi_ui.conn_box))
+        {
+            lv_obj_set_y(wifi_ui.conn_box, original_y);
+        }
+        if (kb != NULL && lv_obj_is_valid(kb))
+        {
+            lv_keyboard_set_textarea(kb, NULL);
+            lv_obj_add_flag(kb, LV_OBJ_FLAG_HIDDEN);
+        }
     }
 }
 
@@ -933,7 +1192,11 @@ static void event_handler(void* arg, esp_event_base_t event_base, int32_t event_
 
         if (wifi_ui_active && !wifi_connect_wait_running && wifi_started)
         {
-            esp_wifi_connect();
+            esp_err_t ret = esp_wifi_connect();
+            if (ret != ESP_OK)
+            {
+                ESP_LOGW(TAG, "WiFi reconnect failed: %s", esp_err_to_name(ret));
+            }
         }
         return;
     }
@@ -956,33 +1219,99 @@ static void event_handler(void* arg, esp_event_base_t event_base, int32_t event_
  * @brief       初始化WiFi模块
  * @note        初始化WiFi驱动和事件处理器
  */
-void wifi_module_init(void) {
-    if (!wifi_initialized) {
-        nvs_flash_init();
+static esp_err_t wifi_module_init(void)
+{
+    esp_err_t ret;
 
-        esp_netif_init();  
-        esp_event_loop_create_default();
+    if (!wifi_initialized)
+    {
+        ret = nvs_flash_init();
+        if (ret != ESP_OK)
+        {
+            return ret;
+        }
 
-        esp_netif_create_default_wifi_sta();
+        ret = esp_netif_init();
+        if (ret != ESP_OK)
+        {
+            return ret;
+        }
+
+        ret = esp_event_loop_create_default();
+        if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE)
+        {
+            return ret;
+        }
+
+        if (wifi_sta_netif == NULL)
+        {
+            wifi_sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+            if (wifi_sta_netif == NULL)
+            {
+                wifi_sta_netif = esp_netif_create_default_wifi_sta();
+            }
+            if (wifi_sta_netif == NULL)
+            {
+                return ESP_FAIL;
+            }
+        }
 
         wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-        esp_wifi_init(&cfg);
-        esp_wifi_set_storage(WIFI_STORAGE_RAM);
+        ret = esp_wifi_init(&cfg);
+        if (ret != ESP_OK)
+        {
+            return ret;
+        }
 
         wifi_initialized = true;
     }
 
-    if (!event_handlers_registered) {
-        esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL);
-        esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler, NULL);
-        esp_event_handler_register(IP_EVENT, IP_EVENT_STA_LOST_IP, &event_handler, NULL);
-        event_handlers_registered = true;
+    if (!wifi_storage_configured)
+    {
+        ret = esp_wifi_set_storage(WIFI_STORAGE_RAM);
+        if (ret != ESP_OK)
+        {
+            return ret;
+        }
+        wifi_storage_configured = true;
     }
 
     if (wifi_event_group == NULL)
     {
         wifi_event_group = xEventGroupCreate();
+        if (wifi_event_group == NULL)
+        {
+            return ESP_ERR_NO_MEM;
+        }
     }
+
+    if (!event_handlers_registered)
+    {
+        ret = esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL);
+        if (ret != ESP_OK)
+        {
+            return ret;
+        }
+
+        ret = esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler, NULL);
+        if (ret != ESP_OK)
+        {
+            esp_event_handler_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler);
+            return ret;
+        }
+
+        ret = esp_event_handler_register(IP_EVENT, IP_EVENT_STA_LOST_IP, &event_handler, NULL);
+        if (ret != ESP_OK)
+        {
+            esp_event_handler_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler);
+            esp_event_handler_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler);
+            return ret;
+        }
+
+        event_handlers_registered = true;
+    }
+
+    return ESP_OK;
 }
 
 /**
@@ -1107,12 +1436,10 @@ void wifi_app_init(void)
     
     /* 创建状态标签 */
     status_label = lv_label_create(wifi_ui.wifi_main_ui);
-    wifi_module_init();
     lv_label_set_text(status_label, "");                      /* 初始为空 */
     lv_obj_add_style(status_label, &title_style, 0);      /* 应用标题样式 */
     lv_obj_align(status_label, LV_ALIGN_TOP_MID, 0, 40);      /* 屏幕顶部中间 */
     
-    wifi_start_sta();
     
     lv_hidden_box();                              /* 隐藏主界面（自定义函数）*/
     
@@ -1121,30 +1448,7 @@ void wifi_app_init(void)
     app_obj_general.APP_Function = wifi_app_del;        /* 设置清理回调 */
     app_obj_general.app_state = NOT_DEL_STATE;          /* 设置应用状态 */
     lv_obj_move_foreground(back_btn);                   /* 将返回按钮置顶 */
-    
-    // 添加返回按钮点击事件
-    if (!wifi_back_event_registered)
-    {
-        lv_obj_add_event_cb(back_btn, back_button_event, LV_EVENT_CLICKED, NULL);
-        wifi_back_event_registered = true;
-    }
-
     wifi_start_scan();
-}
-
-/**
- * @brief   返回按钮事件处理函数
- * @note    处理返回按钮点击事件，关闭弹窗并返回主界面
- * @param   e LVGL事件对象
- * @retval  无
- */
-static void back_button_event(lv_event_t *e) 
-{
-    if (wifi_ui.conn_box && lv_obj_is_valid(wifi_ui.conn_box)) 
-	{
-        lv_msgbox_close(wifi_ui.conn_box);        /* 关闭消息弹窗 */
-    }
-    wifi_app_del();                                 /* 清理WiFi应用资源 */
 }
 
 /**
@@ -1158,11 +1462,25 @@ void wifi_app_del(void)
 {
     wifi_ui_active = false;
     wifi_ui_generation++;
+    wifi_scan_requested_generation = 0;
+
+    if (wifi_connect_wait_running)
+    {
+        wifi_next_connect_wait_generation();
+        wifi_connect_wait_running = false;
+    }
+
+    if (wifi_event_group != NULL)
+    {
+        xEventGroupSetBits(wifi_event_group, WIFI_FAIL_BIT);
+    }
 
     if (wifi_ui.conn_box && lv_obj_is_valid(wifi_ui.conn_box))
     {
         lv_msgbox_close(wifi_ui.conn_box);
     }
+    wifi_ui.conn_box = NULL;
+    wifi_ui.pwd_ta = NULL;
 
     /* 解除全局应用对象绑定 */
     app_obj_general.APP_Function = NULL;          /* 清除回调函数指针 */
@@ -1178,18 +1496,31 @@ void wifi_app_del(void)
     /* 删除键盘对象 */
     status_label = NULL;
 
-    if (kb) 
+    if (kb && lv_obj_is_valid(kb))
 	{
         lv_obj_del(kb);                          /* 删除LVGL键盘 */
-        kb = NULL;                               /* 置空指针 */
     }
+    kb = NULL;
 
     /* 停止网络连接 */
     if (wifi_started)
     {
-        esp_wifi_disconnect();
-        esp_wifi_stop();
-        wifi_started = false;
+        esp_wifi_scan_stop();
+        esp_err_t disconnect_ret = esp_wifi_disconnect();
+        if (disconnect_ret != ESP_OK && disconnect_ret != ESP_ERR_WIFI_NOT_STARTED)
+        {
+            ESP_LOGW(TAG, "WiFi disconnect failed: %s", esp_err_to_name(disconnect_ret));
+        }
+
+        esp_err_t stop_ret = esp_wifi_stop();
+        if (stop_ret == ESP_OK || stop_ret == ESP_ERR_WIFI_NOT_STARTED)
+        {
+            wifi_started = false;
+        }
+        else
+        {
+            ESP_LOGE(TAG, "WiFi stop failed: %s", esp_err_to_name(stop_ret));
+        }
     }
 
     /* 恢复主界面显示 */
@@ -1204,16 +1535,6 @@ void wifi_app_del(void)
         status_timer = NULL;
     }
 
-    if (wifi_event_group != NULL)
-    {
-        xEventGroupClearBits(wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
-    }
-
-    if (wifi_back_event_registered && back_btn != NULL && lv_obj_is_valid(back_btn))
-    {
-        lv_obj_remove_event_cb(back_btn, back_button_event);
-        wifi_back_event_registered = false;
-    }
 }
 
 

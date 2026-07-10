@@ -52,10 +52,10 @@ static inline uint8_t  read_uint8(const uint8_t *p)
 
 static inline uint32_t read_uint32(const uint8_t *p)
 {
-    return (p[0] << 24)
-        | (p[1] << 16)
-        | (p[2] <<  8)
-        | (p[3] <<  0)
+    return ((uint32_t)p[0] << 24)
+        | ((uint32_t)p[1] << 16)
+        | ((uint32_t)p[2] <<  8)
+        | ((uint32_t)p[3] <<  0)
     ;
 }
 
@@ -296,13 +296,39 @@ static inline int paeth(int a, int b, int c)
 
 static int set_interlace_pass(pngle_t *pngle, uint_fast8_t pass)
 {
+    if (pass > 7) return PNGLE_ERROR("Invalid interlace pass");
+
+    size_t channels = (size_t)pngle->channels;
+    size_t depth = (size_t)pngle->hdr.depth;
+    if (depth != 0 && channels > SIZE_MAX / depth) return PNGLE_ERROR("Image is too large");
+    size_t bits_per_pixel = channels * depth;
+    if (bits_per_pixel > SIZE_MAX - 7) return PNGLE_ERROR("Image is too large");
+    size_t bytes_per_pixel = (bits_per_pixel + 7) / 8;
+
+    size_t offset = interlace_off_x[pass];
+    size_t divisor = interlace_div_x[pass];
+    size_t scanline_pixels = 0;
+    if ((size_t)pngle->hdr.width > offset)
+    {
+        size_t remaining = (size_t)pngle->hdr.width - offset;
+        size_t rounding = divisor - 1;
+        if (remaining > SIZE_MAX - rounding) return PNGLE_ERROR("Image is too large");
+        scanline_pixels = (remaining + rounding) / divisor;
+    }
+
+    if (channels != 0 && scanline_pixels > SIZE_MAX / channels) return PNGLE_ERROR("Image is too large");
+    size_t scanline_samples = scanline_pixels * channels;
+    if (depth != 0 && scanline_samples > SIZE_MAX / depth) return PNGLE_ERROR("Image is too large");
+    size_t scanline_bits = scanline_samples * depth;
+    if (scanline_bits > SIZE_MAX - 7) return PNGLE_ERROR("Image is too large");
+    size_t scanline_stride = (scanline_bits + 7) / 8;
+
+    if (bytes_per_pixel > SIZE_MAX / 2) return PNGLE_ERROR("Image is too large");
+    size_t padding = bytes_per_pixel * 2;
+    if (scanline_stride > SIZE_MAX - padding) return PNGLE_ERROR("Image is too large");
+
     pngle->interlace_pass = pass;
-
-    uint_fast8_t bytes_per_pixel = (pngle->channels * pngle->hdr.depth + 7) / 8; // 1 if depth <= 8
-    size_t scanline_pixels = (pngle->hdr.width - interlace_off_x[pngle->interlace_pass] + interlace_div_x[pngle->interlace_pass] - 1) / interlace_div_x[pngle->interlace_pass];
-    size_t scanline_stride = (scanline_pixels * pngle->channels * pngle->hdr.depth + 7) / 8;
-
-    pngle->scanline_ringbuf_size = scanline_stride + bytes_per_pixel * 2; // 2 rooms for c/x and a
+    pngle->scanline_ringbuf_size = scanline_stride + padding;
 
     if (pngle->scanline_ringbuf) free(pngle->scanline_ringbuf);
     if ((pngle->scanline_ringbuf = PNGLE_CALLOC(pngle->scanline_ringbuf_size, 1, "scanline ringbuf")) == NULL) return PNGLE_ERROR("Insufficient memory");
@@ -439,9 +465,12 @@ static int pngle_handle_chunk(pngle_t *pngle, const uint8_t *buf, size_t len)
         pngle->hdr.filter      = read_uint8 (buf + 11);
         pngle->hdr.interlace   = read_uint8 (buf + 12);
 
+        if (pngle->hdr.width == 0 || pngle->hdr.height == 0) return PNGLE_ERROR("Invalid image size");
+        if (pngle->hdr.width > 0x7FFFFFFFU || pngle->hdr.height > 0x7FFFFFFFU) return PNGLE_ERROR("Image is too large");
+        if (pngle->hdr.interlace > 1) return PNGLE_ERROR("Unsupported interlace type in IHDR");
 
-        debug_printf("[pngle]     width      : %d\n", pngle->hdr.width      );
-        debug_printf("[pngle]     height     : %d\n", pngle->hdr.height     );
+        debug_printf("[pngle]     width      : %u\n", pngle->hdr.width      );
+        debug_printf("[pngle]     height     : %u\n", pngle->hdr.height     );
         debug_printf("[pngle]     depth      : %d\n", pngle->hdr.depth      );
         debug_printf("[pngle]     color_type : %d\n", pngle->hdr.color_type );
         debug_printf("[pngle]     compression: %d\n", pngle->hdr.compression);

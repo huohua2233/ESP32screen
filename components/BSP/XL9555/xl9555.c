@@ -19,14 +19,49 @@ static SemaphoreHandle_t xl9555_mutex = NULL;
 static uint16_t xl9555_output_shadow = 0;
 static bool xl9555_output_shadow_valid = false;
 
+#define XL9555_LOCK_TIMEOUT_MS 100
+#define XL9555_I2C_TIMEOUT_MS 100
+#define XL9555_CONFIG_RETRY_COUNT 3
+#define XL9555_CONFIG_RETRY_DELAY_MS 20
+
 static bool xl9555_lock(void)
 {
-    return xl9555_mutex != NULL && xSemaphoreTakeRecursive(xl9555_mutex, portMAX_DELAY) == pdTRUE;
+    return xl9555_mutex != NULL &&
+           xSemaphoreTakeRecursive(xl9555_mutex, pdMS_TO_TICKS(XL9555_LOCK_TIMEOUT_MS)) == pdTRUE;
 }
 
 static void xl9555_unlock(void)
 {
     xSemaphoreGiveRecursive(xl9555_mutex);
+}
+
+static esp_err_t xl9555_read_register(uint8_t reg, uint8_t *data, size_t len)
+{
+    if (data == NULL || len == 0)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (xl9555_handle == NULL || xl9555_mutex == NULL)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (!xl9555_lock())
+    {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    esp_err_t ret = i2c_master_transmit_receive(xl9555_handle, &reg, 1, data, len,
+                                                XL9555_I2C_TIMEOUT_MS);
+    if (ret == ESP_OK && reg == XL9555_OUTPUT_PORT0_REG && len >= 2)
+    {
+        xl9555_output_shadow = ((uint16_t)data[1] << 8) | data[0];
+        xl9555_output_shadow_valid = true;
+    }
+
+    xl9555_unlock();
+    return ret;
 }
 
 /**
@@ -37,22 +72,7 @@ static void xl9555_unlock(void)
  */
 esp_err_t xl9555_read_byte(uint8_t *data, size_t len)
 {
-    if (data == NULL || len == 0 || xl9555_handle == NULL || !xl9555_lock())
-    {
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    uint8_t reg_addr = XL9555_OUTPUT_PORT0_REG;
-    esp_err_t ret = i2c_master_transmit_receive(xl9555_handle, &reg_addr, 1, data, len, -1);
-
-    if (ret == ESP_OK && len >= 2)
-    {
-        xl9555_output_shadow = ((uint16_t)data[1] << 8) | data[0];
-        xl9555_output_shadow_valid = true;
-    }
-
-    xl9555_unlock();
-    return ret;
+    return xl9555_read_register(XL9555_OUTPUT_PORT0_REG, data, len);
 }
 
 /**
@@ -64,9 +84,19 @@ esp_err_t xl9555_read_byte(uint8_t *data, size_t len)
  */
 esp_err_t xl9555_write_byte(uint8_t reg, uint8_t *data, size_t len)
 {
-    if (data == NULL || len == 0 || xl9555_handle == NULL || !xl9555_lock())
+    if (data == NULL || len == 0)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (xl9555_handle == NULL || xl9555_mutex == NULL)
     {
         return ESP_ERR_INVALID_STATE;
+    }
+
+    if (!xl9555_lock())
+    {
+        return ESP_ERR_TIMEOUT;
     }
 
     uint8_t *buf = malloc(1 + len);
@@ -80,7 +110,8 @@ esp_err_t xl9555_write_byte(uint8_t reg, uint8_t *data, size_t len)
     buf[0] = reg;                   /* 0号元素为寄存器数值 */
     memcpy(buf + 1, data, len);     /* 拷贝数据至存储区中 */
 
-    esp_err_t ret = i2c_master_transmit(xl9555_handle, buf, len + 1, -1);
+    esp_err_t ret = i2c_master_transmit(xl9555_handle, buf, len + 1,
+                                        XL9555_I2C_TIMEOUT_MS);
 
     free(buf);                      /* 发送完成释放内存 */
 
@@ -144,17 +175,15 @@ uint16_t xl9555_pin_write(uint16_t pin, int val)
  */
 int xl9555_pin_read(uint16_t pin)
 {
-    if (!xl9555_lock())
+    uint8_t input[2];
+    esp_err_t ret = xl9555_read_register(XL9555_INPUT_PORT0_REG, input, sizeof(input));
+    if (ret != ESP_OK)
     {
         return -1;
     }
 
-    uint8_t input[2];
-    esp_err_t ret = xl9555_read_byte(input, sizeof(input));
-    int value = ret == ESP_OK ? ((xl9555_output_shadow & pin) ? 1 : 0) : -1;
-
-    xl9555_unlock();
-    return value;
+    uint16_t input_value = ((uint16_t)input[1] << 8) | input[0];
+    return (input_value & pin) ? 1 : 0;
 }
 
 /**
@@ -162,7 +191,7 @@ int xl9555_pin_read(uint16_t pin)
  * @param       config_value：IO配置输入或者输出
  * @retval      返回设置的数值
  */
-void xl9555_ioconfig(uint16_t config_value)
+static esp_err_t xl9555_ioconfig(uint16_t config_value)
 {
     /* 从机地址 + CMD + data1(P0) + data2(P1) */
     /* P10、P11、P12、P13和P14为输入，其他引脚为输出 -->0001 1111 0000 0000 注意：0为输出，1为输入*/
@@ -172,17 +201,22 @@ void xl9555_ioconfig(uint16_t config_value)
     data[0] = (uint8_t)(0xFF & config_value);
     data[1] = (uint8_t)(0xFF & (config_value >> 8));
 
-    do
+    for (int attempt = 0; attempt < XL9555_CONFIG_RETRY_COUNT; attempt++)
     {
         err = xl9555_write_byte(XL9555_CONFIG_PORT0_REG, data, 2);
-        if (err != ESP_OK)
+        if (err == ESP_OK)
         {
-            ESP_LOGE(xl9555_tag, "%s configure %X failed, ret: %d", __func__, config_value, err);
+            return ESP_OK;
         }
-        
-        vTaskDelay(pdMS_TO_TICKS(100));
-        
-    } while (err != ESP_OK);
+
+        ESP_LOGE(xl9555_tag, "%s configure %X failed, ret: %d", __func__, config_value, err);
+        if (attempt + 1 < XL9555_CONFIG_RETRY_COUNT)
+        {
+            vTaskDelay(pdMS_TO_TICKS(XL9555_CONFIG_RETRY_DELAY_MS));
+        }
+    }
+
+    return err;
 }
 
 /**
@@ -193,6 +227,7 @@ void xl9555_ioconfig(uint16_t config_value)
 esp_err_t xl9555_init(void)
 {
     uint8_t r_data[2];
+    esp_err_t ret;
 
     if (xl9555_mutex == NULL)
     {
@@ -206,7 +241,11 @@ esp_err_t xl9555_init(void)
     /* 未调用myiic_init初始化IIC */
     if (bus_handle == NULL)
     {
-        ESP_ERROR_CHECK(myiic_init());
+        ret = myiic_init();
+        if (ret != ESP_OK)
+        {
+            return ret;
+        }
     }
 
     i2c_device_config_t xl9555_i2c_dev_conf = {
@@ -214,17 +253,27 @@ esp_err_t xl9555_init(void)
         .scl_speed_hz    = IIC_SPEED_CLK,       /* 传输速率 */
         .device_address  = XL9555_ADDR,         /* 从机7位的地址 */
     };
-    /* I2C总线上添加XL9555设备 */
-    ESP_ERROR_CHECK(i2c_master_bus_add_device(bus_handle, &xl9555_i2c_dev_conf, &xl9555_handle));
+    if (xl9555_handle == NULL)
+    {
+        ret = i2c_master_bus_add_device(bus_handle, &xl9555_i2c_dev_conf, &xl9555_handle);
+        if (ret != ESP_OK)
+        {
+            return ret;
+        }
+    }
 
     /* 上电先读取一次清除中断标志 */
-    esp_err_t ret = xl9555_read_byte(r_data, 2);
+    ret = xl9555_read_register(XL9555_INPUT_PORT0_REG, r_data, 2);
     if (ret != ESP_OK)
     {
         return ret;
     }
     /* 配置那些扩展管脚为输入输出模式 */
-    xl9555_ioconfig(0xF003);
+    ret = xl9555_ioconfig(0xF003);
+    if (ret != ESP_OK)
+    {
+        return ret;
+    }
 
     return ESP_OK;
 }

@@ -7,9 +7,10 @@
  */
 
  #include "lvgl.h"
+ #include <stdint.h>
  #include "stdlib.h"
  #include "xiaoxiaole.h"
- 
+
  
  /* 静态全局变量声明 */
  static const unsigned int color_lib[7] = {red, green, blue, gblue, yellow, rblue, orange}; /* 颜色库 */
@@ -21,8 +22,21 @@
  static lv_obj_t *score_lable;                       /* 分数标签 */
  static float screen_ratio;                          /* 屏幕比例系数 */
  static bool initialized = false;
-static bool game_closing = false;
-static bool game_busy = false;                    /* 游戏初始化标志位 */
+ static bool game_closing = false;
+ static bool game_busy = false;                    /* 游戏初始化标志位 */
+ typedef enum {
+     GAME_ANIM_NONE,
+     GAME_ANIM_EXCHANGE,
+     GAME_ANIM_FLASH,
+     GAME_ANIM_COIN,
+     GAME_ANIM_FALL
+ } game_anim_phase_t;
+ static game_anim_phase_t game_anim_phase = GAME_ANIM_NONE;
+ static uint32_t game_anim_pending = 0;
+ static uintptr_t game_anim_generation = 0;
+ static bool game_anim_launching = false;
+ static lv_point_t game_touch_start;
+ static bool game_touch_active = false;
  extern lv_obj_t * back_btn;
  
  
@@ -32,6 +46,7 @@ static bool game_busy = false;                    /* 游戏初始化标志位 */
  static void move_obj_cb(lv_event_t *e);
  static void x_move_cb(void *var, int32_t v);
  static void y_move_cb(void *var, int32_t v);
+ static void coin_move_cb(void *var, int32_t v);
  static void exchange_done_cb(lv_anim_t *a);
  static void same_color_move_to_coin(void);
  static int same_color_check(void);
@@ -49,6 +64,172 @@ static bool game_busy = false;                    /* 游戏初始化标志位 */
  static void flash_end_cb(lv_anim_t *a);
  static void flash_cb(void *var, int32_t v);
  static void same_color_flash(void);
+ static void game_anim_advance(game_anim_phase_t phase);
+
+ static void game_anim_next_generation(void)
+ {
+     if(game_anim_generation >= (UINTPTR_MAX >> 8))
+     {
+         game_anim_generation = 1;
+     }
+     else
+     {
+         game_anim_generation++;
+     }
+ }
+
+ static void game_anim_invalidate(void)
+ {
+     game_anim_next_generation();
+     game_anim_phase = GAME_ANIM_NONE;
+     game_anim_pending = 0;
+     game_anim_launching = false;
+     game_touch_active = false;
+ }
+
+ static void game_anim_begin(game_anim_phase_t phase)
+ {
+     game_anim_next_generation();
+     game_anim_phase = phase;
+     game_anim_pending = 0;
+     game_anim_launching = true;
+     game_busy = true;
+     game_touch_active = false;
+ }
+
+ static bool game_anim_start_item(lv_anim_t *a, game_anim_phase_t phase, lv_anim_ready_cb_t ready_cb)
+ {
+     if(game_closing || game_anim_phase != phase)
+     {
+         return false;
+     }
+
+     uintptr_t token = (game_anim_generation << 8) | (uintptr_t)phase;
+     lv_anim_set_user_data(a, (void *)token);
+     lv_anim_set_ready_cb(a, ready_cb);
+     game_anim_pending++;
+     if(lv_anim_start(a) == NULL)
+     {
+         game_anim_pending--;
+         return false;
+     }
+
+     return true;
+ }
+
+ static bool game_anim_is_current(lv_anim_t *a, game_anim_phase_t phase)
+ {
+     if(a == NULL || game_closing || game_anim_phase != phase)
+     {
+         return false;
+     }
+
+     uintptr_t token = (uintptr_t)lv_anim_get_user_data(a);
+     uintptr_t expected = (game_anim_generation << 8) | (uintptr_t)phase;
+     return token == expected;
+ }
+
+ static void game_anim_try_finish(void)
+ {
+     if(game_closing || game_anim_launching || game_anim_phase == GAME_ANIM_NONE || game_anim_pending != 0)
+     {
+         return;
+     }
+
+     game_anim_phase_t phase = game_anim_phase;
+     game_anim_phase = GAME_ANIM_NONE;
+     game_anim_advance(phase);
+ }
+
+ static void game_anim_end_launch(void)
+ {
+     game_anim_launching = false;
+     game_anim_try_finish();
+ }
+
+ static void game_anim_complete_item(void)
+ {
+     if(game_anim_pending == 0)
+     {
+         return;
+     }
+
+     game_anim_pending--;
+     game_anim_try_finish();
+ }
+
+ static void game_finish_turn(void)
+ {
+     if(game_closing)
+     {
+         return;
+     }
+
+     game_busy = false;
+     game_touch_active = false;
+     if(lv_obj_is_valid(refs_btn))
+     {
+         lv_obj_add_flag(refs_btn, LV_OBJ_FLAG_CLICKABLE);
+     }
+     add_all_clickable();
+ }
+
+ static void game_anim_advance(game_anim_phase_t phase)
+ {
+     if(game_closing)
+     {
+         return;
+     }
+
+     switch(phase)
+     {
+         case GAME_ANIM_EXCHANGE:
+             if(same_color_check())
+             {
+                 same_color_flash();
+             }
+             else
+             {
+                 game_finish_turn();
+             }
+             break;
+
+         case GAME_ANIM_FLASH:
+             same_color_move_to_coin();
+             break;
+
+         case GAME_ANIM_COIN:
+             if(lv_obj_is_valid(score_lable))
+             {
+                 lv_label_set_text_fmt(score_lable, "SCORE:%d", score);
+             }
+             obj_move_down();
+             break;
+
+         case GAME_ANIM_FALL:
+             if(!map_is_full())
+             {
+                 obj_move_down();
+             }
+             else
+             {
+                 set_obj_userdata();
+                 if(same_color_check())
+                 {
+                     same_color_flash();
+                 }
+                 else
+                 {
+                     game_finish_turn();
+                 }
+             }
+             break;
+
+         default:
+             game_finish_turn();
+             break;
+     }
+ }
  
  /* 图片资源声明 */
  LV_IMG_DECLARE(xiaoxiaole_bg_img)
@@ -130,8 +311,9 @@ static bool game_busy = false;                    /* 游戏初始化标志位 */
  
  void lv_game_del(void)
  {
-	 game_closing = true;
-	 game_busy = true;
+     game_closing = true;
+     game_busy = true;
+     game_anim_invalidate();
 
 	 if(screen1 != NULL && lv_obj_is_valid(screen1))
 	 {
@@ -172,9 +354,14 @@ static bool game_busy = false;                    /* 游戏初始化标志位 */
   */
  static void game_init(void)
  {
-	 int i, j;
-	 score = 0;
-	 game_busy = true;
+     int i, j;
+     game_anim_invalidate();
+     score = 0;
+     if(lv_obj_is_valid(score_lable))
+     {
+         lv_label_set_text_fmt(score_lable, "SCORE:%d", score);
+     }
+     game_busy = true;
 	 lv_obj_refr_size(game_window);
  
 	 /* 删除旧对象（如果存在） */
@@ -207,8 +394,8 @@ static bool game_busy = false;                    /* 游戏初始化标志位 */
 			 lv_obj_set_style_bg_color(game_obj[j][i].obj, lv_color_hex(color_lib[game_obj[j][i].color_index]), 0);
 			 /* 设置用户数据和事件回调 */
 			 game_obj[j][i].obj->user_data = &game_obj[j][i];
-			 lv_obj_add_event_cb(game_obj[j][i].obj, move_obj_cb, LV_EVENT_PRESSING, 0);
-			 lv_obj_add_event_cb(game_obj[j][i].obj, move_obj_cb, LV_EVENT_RELEASED, 0);
+             lv_obj_add_event_cb(game_obj[j][i].obj, move_obj_cb, LV_EVENT_PRESSED, 0);
+             lv_obj_add_event_cb(game_obj[j][i].obj, move_obj_cb, LV_EVENT_RELEASED, 0);
 		 }
 	 }
  
@@ -218,12 +405,10 @@ static bool game_busy = false;                    /* 游戏初始化标志位 */
 		 same_color_flash();
 		 lv_obj_clear_flag(refs_btn, LV_OBJ_FLAG_CLICKABLE);
 	 }
-	 else
-	 {
-		 game_busy = false;
-		 lv_obj_add_flag(refs_btn, LV_OBJ_FLAG_CLICKABLE);
-		 add_all_clickable();
-	 }
+     else
+     {
+         game_finish_turn();
+     }
  }
  
  /**
@@ -233,71 +418,95 @@ static bool game_busy = false;                    /* 游戏初始化标志位 */
   */
  static void exchange_obj(game_obj_type *obj1, game_obj_type *obj2)
  {
-	 game_obj_type temp;
-	 
-	 if(game_closing) return;
-	 game_busy = true;
-	 lv_obj_clear_flag(refs_btn, LV_OBJ_FLAG_CLICKABLE);
-	 clear_all_clickable();
-	 
-	 /* 保存临时颜色信息 */
-	 temp.color_index = obj1->color_index;
-	 temp.obj = obj1->obj;
+     game_obj_type temp;
+
+     if(game_closing || obj1 == NULL || obj2 == NULL ||
+        !lv_obj_is_valid(obj1->obj) || !lv_obj_is_valid(obj2->obj))
+     {
+         return;
+     }
+
+     game_busy = true;
+     game_touch_active = false;
+     lv_obj_clear_flag(refs_btn, LV_OBJ_FLAG_CLICKABLE);
+     clear_all_clickable();
+
+     /* 保存临时颜色信息 */
+     temp.color_index = obj1->color_index;
+     temp.obj = obj1->obj;
  
-	 /* 交换颜色索引 */
-	 obj1->color_index = obj2->color_index;
-	 obj2->color_index = temp.color_index;
-			 
-	 /* 创建X轴移动动画 */
-	 lv_anim_t a1;
-	 lv_anim_init(&a1);
-	 lv_anim_set_var(&a1, obj1->obj);
-	 lv_anim_set_exec_cb(&a1, x_move_cb);
-	 lv_anim_set_time(&a1, 200);
-	 if(!has_same_color()) { lv_anim_set_playback_time(&a1, 200); }
-	 lv_anim_set_values(&a1, obj1->x * 35 * screen_ratio + 1, obj2->x * 35 * screen_ratio + 1);
-	 lv_anim_set_path_cb(&a1, lv_anim_path_ease_out);
-	 lv_anim_start(&a1);
-		 
-	 /* 创建Y轴移动动画 */
-	 lv_anim_t a2;
-	 lv_anim_init(&a2);
-	 lv_anim_set_var(&a2, obj1->obj);
-	 lv_anim_set_exec_cb(&a2, y_move_cb);
-	 lv_anim_set_time(&a2, 200);
-	 if(!has_same_color()) { lv_anim_set_playback_time(&a2, 200); }
-	 lv_anim_set_values(&a2, obj1->y * 35 * screen_ratio + 1, obj2->y * 35 * screen_ratio + 1);
-	 lv_anim_set_path_cb(&a2, lv_anim_path_ease_out);
-	 lv_anim_start(&a2);
-	 
-	 /* 创建第二个对象X轴动画 */
-	 lv_anim_t a3;
-	 lv_anim_init(&a3);
-	 lv_anim_set_var(&a3, obj2->obj);
-	 lv_anim_set_exec_cb(&a3, x_move_cb);
-	 lv_anim_set_time(&a3, 200);
-	 if(!has_same_color()) { lv_anim_set_playback_time(&a3, 200); }
-	 lv_anim_set_values(&a3, obj2->x * 35 * screen_ratio + 1, obj1->x * 35 * screen_ratio + 1);
-	 lv_anim_set_path_cb(&a3, lv_anim_path_ease_out);
-	 lv_anim_start(&a3);
- 
-	 /* 创建第二个对象Y轴动画（带完成回调） */
-	 lv_anim_t a4;
-	 lv_anim_init(&a4);
-	 lv_anim_set_var(&a4, obj2->obj);
-	 lv_anim_set_exec_cb(&a4, y_move_cb);
-	 lv_anim_set_ready_cb(&a4, exchange_done_cb);
-	 lv_anim_set_time(&a4, 200);
-	 if(!has_same_color()) { lv_anim_set_playback_time(&a4, 200); }
-	 lv_anim_set_values(&a4, obj2->y * 35 * screen_ratio + 1, obj1->y * 35 * screen_ratio + 1);
-	 lv_anim_set_path_cb(&a4, lv_anim_path_ease_out);
-	 lv_anim_start(&a4);    
-		 
-	 /* 根据匹配结果处理对象交换 */
-	 if(has_same_color()) 
-	 {
-		 /* 有效交换：交换对象指针 */
-		 obj1->obj = obj2->obj;
+     /* 交换颜色索引 */
+     obj1->color_index = obj2->color_index;
+     obj2->color_index = temp.color_index;
+
+     bool valid_exchange = has_same_color();
+     int32_t obj1_x = obj1->x * 35 * screen_ratio + 1;
+     int32_t obj1_y = obj1->y * 35 * screen_ratio + 1;
+     int32_t obj2_x = obj2->x * 35 * screen_ratio + 1;
+     int32_t obj2_y = obj2->y * 35 * screen_ratio + 1;
+     game_anim_begin(GAME_ANIM_EXCHANGE);
+
+     /* 创建X轴移动动画 */
+     lv_anim_t a1;
+     lv_anim_init(&a1);
+     lv_anim_set_var(&a1, obj1->obj);
+     lv_anim_set_exec_cb(&a1, x_move_cb);
+     lv_anim_set_time(&a1, 200);
+     if(!valid_exchange) { lv_anim_set_playback_time(&a1, 200); }
+     lv_anim_set_values(&a1, obj1_x, obj2_x);
+     lv_anim_set_path_cb(&a1, lv_anim_path_ease_out);
+     if(!game_anim_start_item(&a1, GAME_ANIM_EXCHANGE, exchange_done_cb))
+     {
+         lv_obj_set_x(obj1->obj, valid_exchange ? obj2_x : obj1_x);
+     }
+
+     /* 创建Y轴移动动画 */
+     lv_anim_t a2;
+     lv_anim_init(&a2);
+     lv_anim_set_var(&a2, obj1->obj);
+     lv_anim_set_exec_cb(&a2, y_move_cb);
+     lv_anim_set_time(&a2, 200);
+     if(!valid_exchange) { lv_anim_set_playback_time(&a2, 200); }
+     lv_anim_set_values(&a2, obj1_y, obj2_y);
+     lv_anim_set_path_cb(&a2, lv_anim_path_ease_out);
+     if(!game_anim_start_item(&a2, GAME_ANIM_EXCHANGE, exchange_done_cb))
+     {
+         lv_obj_set_y(obj1->obj, valid_exchange ? obj2_y : obj1_y);
+     }
+
+     /* 创建第二个对象X轴动画 */
+     lv_anim_t a3;
+     lv_anim_init(&a3);
+     lv_anim_set_var(&a3, obj2->obj);
+     lv_anim_set_exec_cb(&a3, x_move_cb);
+     lv_anim_set_time(&a3, 200);
+     if(!valid_exchange) { lv_anim_set_playback_time(&a3, 200); }
+     lv_anim_set_values(&a3, obj2_x, obj1_x);
+     lv_anim_set_path_cb(&a3, lv_anim_path_ease_out);
+     if(!game_anim_start_item(&a3, GAME_ANIM_EXCHANGE, exchange_done_cb))
+     {
+         lv_obj_set_x(obj2->obj, valid_exchange ? obj1_x : obj2_x);
+    }
+
+    /* 创建第二个对象Y轴动画（带完成回调） */
+     lv_anim_t a4;
+     lv_anim_init(&a4);
+     lv_anim_set_var(&a4, obj2->obj);
+     lv_anim_set_exec_cb(&a4, y_move_cb);
+     lv_anim_set_time(&a4, 200);
+     if(!valid_exchange) { lv_anim_set_playback_time(&a4, 200); }
+     lv_anim_set_values(&a4, obj2_y, obj1_y);
+     lv_anim_set_path_cb(&a4, lv_anim_path_ease_out);
+     if(!game_anim_start_item(&a4, GAME_ANIM_EXCHANGE, exchange_done_cb))
+     {
+         lv_obj_set_y(obj2->obj, valid_exchange ? obj1_y : obj2_y);
+     }
+
+     /* 根据匹配结果处理对象交换 */
+     if(valid_exchange)
+     {
+         /* 有效交换：交换对象指针 */
+         obj1->obj = obj2->obj;
 		 obj2->obj = temp.obj;
 		 obj1->obj->user_data = obj1;
 		 obj2->obj->user_data = obj2;
@@ -305,9 +514,11 @@ static bool game_busy = false;                    /* 游戏初始化标志位 */
 	 else 
 	 {
 		 /* 无效交换：恢复颜色 */
-		 obj2->color_index = obj1->color_index;
-		 obj1->color_index = temp.color_index;        
-	 }    
+         obj2->color_index = obj1->color_index;
+         obj1->color_index = temp.color_index;
+     }
+
+     game_anim_end_launch();
  }
  
  /**
@@ -315,68 +526,87 @@ static bool game_busy = false;                    /* 游戏初始化标志位 */
   * @param e     事件指针
   */
  static void move_obj_cb(lv_event_t *e)
- {  
-	 static lv_point_t click_point1, click_point2;
-	 int movex, movey;
-	 direction_type_enum direction;
-	 static bool touched = false;
-	 game_obj_type *stage_data = (game_obj_type *)(((lv_obj_t *)e->target)->user_data);
-	 lv_obj_t *xxx = (lv_obj_t *)e->target;
- 
-	 if(touched == false) 
-	 {    
-		 /* 记录初始点击位置 */
-		 touched = true;                 
-		 lv_indev_get_point(lv_indev_get_act(), &click_point1);
-		 return;
-	 }
- 
-	 if(game_closing || game_busy) return;
-	 if(e->code == LV_EVENT_RELEASED) 
-	 { 
-		 touched = false;
-		 lv_obj_move_foreground(xxx);
-		 lv_indev_get_point(lv_indev_get_act(), &click_point2);
-		 
-		 /* 计算移动向量 */
-		 movex = click_point2.x - click_point1.x;
-		 movey = click_point2.y - click_point1.y;
-		 
-		 /* 过滤无效移动 */
-		 int abs_movex = movex < 0 ? -movex : movex;
-		 int abs_movey = movey < 0 ? -movey : movey;
-		 if(abs_movex < 10 && abs_movey < 10) return;
+ {
+     lv_event_code_t code = lv_event_get_code(e);
+     lv_obj_t *target = lv_event_get_target(e);
 
-		 if(abs_movex >= abs_movey)
-		 {
-			 direction = movex < 0 ? left : right;
-		 }
-		 else
-		 {
-			 direction = movey < 0 ? up : down;
-		 }
- 
-		 /* 处理边界情况并执行交换 */
-		 switch(direction) 
-		 {
-			 case up:
-				 if(stage_data->y != 0) 
-					 exchange_obj(stage_data, &game_obj[stage_data->y-1][stage_data->x]);
-				 break;
-			 case down:
-				 if(stage_data->y != 7) 
-					 exchange_obj(stage_data, &game_obj[stage_data->y+1][stage_data->x]);
-				 break;
-			 case left:
-				 if(stage_data->x != 0) 
-					 exchange_obj(stage_data, &game_obj[stage_data->y][stage_data->x-1]);
-				 break;
-			 case right:
-				 if(stage_data->x != 7) 
-					 exchange_obj(stage_data, &game_obj[stage_data->y][stage_data->x+1]);
-				 break;
-		 }
-	 }
+     if(game_closing || game_busy)
+     {
+         game_touch_active = false;
+         return;
+     }
+
+     lv_indev_t *indev = lv_indev_get_act();
+     if(indev == NULL)
+     {
+         game_touch_active = false;
+         return;
+     }
+
+     if(code == LV_EVENT_PRESSED)
+     {
+         lv_indev_get_point(indev, &game_touch_start);
+         game_touch_active = true;
+         return;
+     }
+
+     if(code != LV_EVENT_RELEASED || !game_touch_active)
+     {
+         return;
+     }
+
+     game_touch_active = false;
+     game_obj_type *stage_data = (game_obj_type *)lv_obj_get_user_data(target);
+     if(stage_data == NULL)
+     {
+         return;
+     }
+
+     lv_point_t release_point;
+     int movex, movey;
+     direction_type_enum direction;
+
+     lv_obj_move_foreground(target);
+     lv_indev_get_point(indev, &release_point);
+
+     /* 计算移动向量 */
+     movex = release_point.x - game_touch_start.x;
+     movey = release_point.y - game_touch_start.y;
+
+     /* 过滤无效移动 */
+     int abs_movex = movex < 0 ? -movex : movex;
+     int abs_movey = movey < 0 ? -movey : movey;
+     if(abs_movex < 10 && abs_movey < 10) return;
+
+     if(abs_movex >= abs_movey)
+     {
+         direction = movex < 0 ? left : right;
+     }
+     else
+     {
+         direction = movey < 0 ? up : down;
+     }
+
+     /* 处理边界情况并执行交换 */
+     switch(direction)
+     {
+         case up:
+             if(stage_data->y != 0)
+                 exchange_obj(stage_data, &game_obj[stage_data->y-1][stage_data->x]);
+             break;
+         case down:
+             if(stage_data->y != 7)
+                 exchange_obj(stage_data, &game_obj[stage_data->y+1][stage_data->x]);
+             break;
+         case left:
+             if(stage_data->x != 0)
+                 exchange_obj(stage_data, &game_obj[stage_data->y][stage_data->x-1]);
+             break;
+         case right:
+             if(stage_data->x != 7)
+                 exchange_obj(stage_data, &game_obj[stage_data->y][stage_data->x+1]);
+             break;
+     }
  }
  
  /**
@@ -400,6 +630,35 @@ static bool game_busy = false;                    /* 游戏初始化标志位 */
 	 lv_obj_t *xxx = (lv_obj_t *)var;
 	 lv_obj_set_y(xxx, v);    
  }
+
+ static void coin_move_cb(void *var, int32_t v)
+ {
+     lv_obj_t *obj = (lv_obj_t *)var;
+     if(!lv_obj_is_valid(obj) || !lv_obj_is_valid(game_window))
+     {
+         return;
+     }
+
+     game_obj_type *stage_data = (game_obj_type *)lv_obj_get_user_data(obj);
+     if(stage_data == NULL)
+     {
+         return;
+     }
+
+     int32_t start_x = stage_data->x * 35 * screen_ratio + 1 + lv_obj_get_x(game_window);
+     int32_t start_y = stage_data->y * 35 * screen_ratio + 1 + lv_obj_get_y(game_window);
+     int32_t remaining = 1024 - v;
+     if(remaining < 0)
+     {
+         remaining = 0;
+     }
+     else if(remaining > 1024)
+     {
+         remaining = 1024;
+     }
+
+     lv_obj_set_pos(obj, start_x * remaining / 1024, start_y * remaining / 1024);
+ }
  
  /**
   * @brief       闪烁动画回调
@@ -417,17 +676,13 @@ static bool game_busy = false;                    /* 游戏初始化标志位 */
   * @param a     动画指针
   */
  static void exchange_done_cb(lv_anim_t *a)
- {    
-	 if(game_closing) return;
-	 if(same_color_check()) 
-	 {
-		 same_color_flash();
-	 } 
-	 else 
-	 { 
-		 game_busy = false;
-		 add_all_clickable();
-	 }            
+ {
+     if(!game_anim_is_current(a, GAME_ANIM_EXCHANGE))
+     {
+         return;
+     }
+
+     game_anim_complete_item();
  }
  
  /**
@@ -506,38 +761,35 @@ static bool game_busy = false;                    /* 游戏初始化标志位 */
   */
  static void same_color_move_to_coin(void)
  {
-	 for(int j = 0; j < 8; j++) 
-	 {
-		 for(int i = 0; i < 8; i++) 
-		 {
-			 if(game_obj[j][i].alive == 0) 
-			 {
-				 /* 移动对象到屏幕层 */
-				 lv_obj_set_parent(game_obj[j][i].obj, screen1);
-				 
-				 /* 创建X轴移动动画 */
-				 lv_anim_t a1;
-				 lv_anim_init(&a1);
-				 lv_anim_set_var(&a1, game_obj[j][i].obj);
-				 lv_anim_set_exec_cb(&a1, x_move_cb);
-				 lv_anim_set_time(&a1, 600);
-				 lv_anim_set_path_cb(&a1, lv_anim_path_ease_in_out);
-				 lv_anim_set_values(&a1, (i)*35*screen_ratio+1+lv_obj_get_x(game_window), 0);
-				 lv_anim_start(&a1);    
-				 
-				 /* 创建Y轴移动动画（带完成回调） */
-				 lv_anim_t a2;
-				 lv_anim_init(&a2);
-				 lv_anim_set_var(&a2, game_obj[j][i].obj);
-				 lv_anim_set_exec_cb(&a2, y_move_cb);
-				 lv_anim_set_time(&a2, 600);
-				 lv_anim_set_path_cb(&a2, lv_anim_path_ease_in_out);
-				 lv_anim_set_ready_cb(&a2, move_to_coin_end_cb);
-				 lv_anim_set_values(&a2, (j)*35*screen_ratio+1+lv_obj_get_y(game_window), 0);
-				 lv_anim_start(&a2);    
-			 }
-		 }
-	 }    
+     game_anim_begin(GAME_ANIM_COIN);
+
+     for(int j = 0; j < 8; j++)
+     {
+         for(int i = 0; i < 8; i++)
+         {
+             if(game_obj[j][i].alive == 0 && lv_obj_is_valid(game_obj[j][i].obj))
+             {
+                 /* 移动对象到屏幕层 */
+                 lv_obj_set_parent(game_obj[j][i].obj, screen1);
+
+                 lv_anim_t a;
+                 lv_anim_init(&a);
+                 lv_anim_set_var(&a, game_obj[j][i].obj);
+                 lv_anim_set_exec_cb(&a, coin_move_cb);
+                 lv_anim_set_time(&a, 600);
+                 lv_anim_set_path_cb(&a, lv_anim_path_ease_in_out);
+                 lv_anim_set_values(&a, 0, 1024);
+                 if(!game_anim_start_item(&a, GAME_ANIM_COIN, move_to_coin_end_cb))
+                 {
+                     lv_obj_set_pos(game_obj[j][i].obj, 0, 0);
+                     lv_obj_del(game_obj[j][i].obj);
+                     score += 10;
+                 }
+             }
+         }
+     }
+
+     game_anim_end_launch();
  }
  
  /**
@@ -545,24 +797,35 @@ static bool game_busy = false;                    /* 游戏初始化标志位 */
   */
  static void same_color_flash(void)
  {
-	 for(int j = 0; j < 8; j++) 
-	 {
-		 for(int i = 0; i < 8; i++) 
-		 {
-			 if(game_obj[j][i].alive == 0) 
-			 {
-				 /* 创建闪烁动画 */
-				 lv_anim_t a2;
+     game_anim_begin(GAME_ANIM_FLASH);
+     if(lv_obj_is_valid(refs_btn))
+     {
+         lv_obj_clear_flag(refs_btn, LV_OBJ_FLAG_CLICKABLE);
+     }
+     clear_all_clickable();
+
+     for(int j = 0; j < 8; j++)
+     {
+         for(int i = 0; i < 8; i++)
+         {
+             if(game_obj[j][i].alive == 0 && lv_obj_is_valid(game_obj[j][i].obj))
+             {
+                 /* 创建闪烁动画 */
+                 lv_anim_t a2;
 				 lv_anim_init(&a2);
-				 lv_anim_set_var(&a2, game_obj[j][i].obj);
-				 lv_anim_set_exec_cb(&a2, flash_cb);
-				 lv_anim_set_time(&a2, 600);
-				 lv_anim_set_ready_cb(&a2, flash_end_cb);
-				 lv_anim_set_values(&a2, 1, 7);
-				 lv_anim_start(&a2);    
-			 }
-		 }    
-	 }        
+                 lv_anim_set_var(&a2, game_obj[j][i].obj);
+                 lv_anim_set_exec_cb(&a2, flash_cb);
+                 lv_anim_set_time(&a2, 600);
+                 lv_anim_set_values(&a2, 1, 7);
+                 if(!game_anim_start_item(&a2, GAME_ANIM_FLASH, flash_end_cb))
+                 {
+                     lv_obj_set_style_bg_opa(game_obj[j][i].obj, LV_OPA_COVER, 0);
+                 }
+             }
+         }
+     }
+
+     game_anim_end_launch();
  }
  
  /**
@@ -570,7 +833,9 @@ static bool game_busy = false;                    /* 游戏初始化标志位 */
   */
  static void obj_move_down(void)
  {
-	 for(int i = 0; i < 8; i++) 
+     game_anim_begin(GAME_ANIM_FALL);
+
+     for(int i = 0; i < 8; i++)
 	 {
 		 for(int j = 7; j > 0; j--) 
 		 {
@@ -583,19 +848,25 @@ static bool game_busy = false;                    /* 游戏初始化标志位 */
 					 game_obj[k][i].obj = game_obj[k-1][i].obj;
 					 game_obj[k][i].color_index = game_obj[k-1][i].color_index;
 					 
-					 if(game_obj[k][i].alive) 
-					 {
-						 game_obj[k][i].obj->user_data = &game_obj[k][i];
+                     if(game_obj[k][i].alive && lv_obj_is_valid(game_obj[k][i].obj))
+                     {
+                         game_obj[k][i].obj->user_data = &game_obj[k][i];
 						 /* 创建下落动画 */
 						 lv_anim_t a1;
 						 lv_anim_init(&a1);
-						 lv_anim_set_var(&a1, game_obj[k][i].obj);
-						 lv_anim_set_exec_cb(&a1, y_move_cb);
-						 lv_anim_set_time(&a1, 150);
-						 lv_anim_set_ready_cb(&a1, move_deleted_cb);
-						 lv_anim_set_values(&a1, (k-1)*35*screen_ratio+1, k*35*screen_ratio+1);
-						 lv_anim_start(&a1);    
-					 }                                    
+                         lv_anim_set_var(&a1, game_obj[k][i].obj);
+                         lv_anim_set_exec_cb(&a1, y_move_cb);
+                         lv_anim_set_time(&a1, 150);
+                         lv_anim_set_values(&a1, (k-1)*35*screen_ratio+1, k*35*screen_ratio+1);
+                         if(!game_anim_start_item(&a1, GAME_ANIM_FALL, move_deleted_cb))
+                         {
+                             lv_obj_set_y(game_obj[k][i].obj, k*35*screen_ratio+1);
+                         }
+                     }
+                     else if(game_obj[k][i].alive)
+                     {
+                         game_obj[k][i].alive = 0;
+                     }
 				 }
 				 
 				 /* 生成新对象 */
@@ -608,19 +879,21 @@ static bool game_busy = false;                    /* 游戏初始化标志位 */
 				 lv_obj_set_size(game_obj[0][i].obj, 35*screen_ratio-2, 35*screen_ratio-2);
 				 lv_obj_set_style_bg_color(game_obj[0][i].obj, lv_color_hex(color_lib[game_obj[0][i].color_index]), 0);
 				 game_obj[0][i].obj->user_data = &game_obj[0][i];
-				 lv_obj_add_event_cb(game_obj[0][i].obj, move_obj_cb, LV_EVENT_PRESSING, 0);
-				 lv_obj_add_event_cb(game_obj[0][i].obj, move_obj_cb, LV_EVENT_RELEASED, 0);
+                 lv_obj_add_event_cb(game_obj[0][i].obj, move_obj_cb, LV_EVENT_PRESSED, 0);
+                 lv_obj_add_event_cb(game_obj[0][i].obj, move_obj_cb, LV_EVENT_RELEASED, 0);
 				 
 				 /* 新对象下落动画 */
 				 lv_anim_t a;
 				 lv_anim_init(&a);
-				 lv_anim_set_var(&a, game_obj[0][i].obj);
-				 lv_anim_set_exec_cb(&a, y_move_cb);
-				 lv_anim_set_time(&a, 150);
-				 lv_anim_set_ready_cb(&a, move_deleted_cb);
-				 lv_anim_set_values(&a, (-1)*35*screen_ratio+1, 0*35*screen_ratio+1);
-				 lv_anim_start(&a);    
-				 break;
+                 lv_anim_set_var(&a, game_obj[0][i].obj);
+                 lv_anim_set_exec_cb(&a, y_move_cb);
+                 lv_anim_set_time(&a, 150);
+                 lv_anim_set_values(&a, (-1)*35*screen_ratio+1, 0*35*screen_ratio+1);
+                 if(!game_anim_start_item(&a, GAME_ANIM_FALL, move_deleted_cb))
+                 {
+                     lv_obj_set_y(game_obj[0][i].obj, 1);
+                 }
+                 break;
 			 }
 		 }
 		 
@@ -636,20 +909,24 @@ static bool game_busy = false;                    /* 游戏初始化标志位 */
 			 lv_obj_set_size(game_obj[0][i].obj, 35*screen_ratio-2, 35*screen_ratio-2);
 			 lv_obj_set_style_bg_color(game_obj[0][i].obj, lv_color_hex(color_lib[game_obj[0][i].color_index]), 0);
 			 game_obj[0][i].obj->user_data = &game_obj[0][i];
-			 lv_obj_add_event_cb(game_obj[0][i].obj, move_obj_cb, LV_EVENT_PRESSING, 0);
-			 lv_obj_add_event_cb(game_obj[0][i].obj, move_obj_cb, LV_EVENT_RELEASED, 0);
+             lv_obj_add_event_cb(game_obj[0][i].obj, move_obj_cb, LV_EVENT_PRESSED, 0);
+             lv_obj_add_event_cb(game_obj[0][i].obj, move_obj_cb, LV_EVENT_RELEASED, 0);
 			 
 			 /* 新对象下落动画 */
 			 lv_anim_t a2;
 			 lv_anim_init(&a2);
-			 lv_anim_set_var(&a2, game_obj[0][i].obj);
-			 lv_anim_set_exec_cb(&a2, y_move_cb);
-			 lv_anim_set_time(&a2, 150);
-			 lv_anim_set_ready_cb(&a2, move_deleted_cb);
-			 lv_anim_set_values(&a2, (-1)*35*screen_ratio+1, 0*35*screen_ratio+1);
-			 lv_anim_start(&a2);    
-		 }                                            
-	 }            
+             lv_anim_set_var(&a2, game_obj[0][i].obj);
+             lv_anim_set_exec_cb(&a2, y_move_cb);
+             lv_anim_set_time(&a2, 150);
+             lv_anim_set_values(&a2, (-1)*35*screen_ratio+1, 0*35*screen_ratio+1);
+             if(!game_anim_start_item(&a2, GAME_ANIM_FALL, move_deleted_cb))
+             {
+                 lv_obj_set_y(game_obj[0][i].obj, 1);
+             }
+         }
+     }
+
+     game_anim_end_launch();
  }    
  
  /**
@@ -658,26 +935,12 @@ static bool game_busy = false;                    /* 游戏初始化标志位 */
   */
  static void move_deleted_cb(lv_anim_t *a)
  {
-	 if(game_closing) return;
-	 if(lv_anim_count_running() == 0) 
-	 {
-		 obj_move_down();        
-	 }
-	 
-	 if(map_is_full()) 
-	 {
-		 if(same_color_check()) 
-		 {
-			 same_color_flash();
-			 set_obj_userdata();
-		 } 
-		 else 
-		 {
-			 game_busy = false;
-			 lv_obj_add_flag(refs_btn, LV_OBJ_FLAG_CLICKABLE);
-			 add_all_clickable();
-		 }            
-	 }
+     if(!game_anim_is_current(a, GAME_ANIM_FALL))
+     {
+         return;
+     }
+
+     game_anim_complete_item();
  }
  
  /**
@@ -726,6 +989,8 @@ static bool game_busy = false;                    /* 游戏初始化标志位 */
 			 {
 				 lv_obj_del(game_obj[j][i].obj);
 			 }
+			 game_obj[j][i].obj = NULL;
+			 game_obj[j][i].alive = 0;
 		 }
 	 }    
  }    
@@ -782,16 +1047,18 @@ static bool game_busy = false;                    /* 游戏初始化标志位 */
   */
  static void move_to_coin_end_cb(lv_anim_t *a)
  {
-	 if(game_closing) return;
-	 lv_obj_t *xxx = (lv_obj_t *)a->var;
-	 lv_obj_del(xxx);
-	 score += 10;
-	 
-	 if(lv_anim_count_running() == 0) 
-	 {
-		 lv_label_set_text_fmt(score_lable,"SCORE:%d",score);
-		 obj_move_down();        
-	 }
+     if(!game_anim_is_current(a, GAME_ANIM_COIN))
+     {
+         return;
+     }
+
+     lv_obj_t *xxx = (lv_obj_t *)a->var;
+     if(lv_obj_is_valid(xxx))
+     {
+         lv_obj_del(xxx);
+     }
+     score += 10;
+     game_anim_complete_item();
  }
  
  /**
@@ -800,11 +1067,12 @@ static bool game_busy = false;                    /* 游戏初始化标志位 */
   */
  static void flash_end_cb(lv_anim_t *a)
  {
-	 if(game_closing) return;
-	 if(lv_anim_count_running() == 0) 
-	 {
-		 same_color_move_to_coin();    
-	 }
+     if(!game_anim_is_current(a, GAME_ANIM_FLASH))
+     {
+         return;
+     }
+
+     game_anim_complete_item();
  }
  
  /**

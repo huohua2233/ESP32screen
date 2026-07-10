@@ -19,7 +19,10 @@
 #include "exfuns.h"
 #include "esp_rtc.h"
 #include "esp_wifi.h"
+#include "esp_log.h"
 #include "usart.h"
+
+static const char *TAG = "APP_MAIN";
 
 
 /**
@@ -38,14 +41,35 @@ void app_main(void)
 
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
     {
-        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_erase();
+        if (ret != ESP_OK)
+        {
+            ESP_LOGE(TAG, "NVS erase failed: %s", esp_err_to_name(ret));
+            return;
+        }
         ret = nvs_flash_init();
     }
 
-    myiic_init();                       /* 初始化IIC0 */
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "NVS init failed: %s", esp_err_to_name(ret));
+        return;
+    }
+
+    ret = myiic_init();                 /* 初始化IIC0 */
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "I2C init failed: %s", esp_err_to_name(ret));
+        return;
+    }
     my_spi_init();                      /* 初始化SPI */
     key_init();                         /* 初始化KEY */
-    xl9555_init();                      /* 初始化IO扩展芯片 */
+    ret = xl9555_init();                /* 初始化IO扩展芯片 */
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "XL9555 init failed: %s", esp_err_to_name(ret));
+        return;
+    }
 	usart_init(115200);                 /* 初始化串口0 */ 
     rtc_time_init();
     rtc_restore_saved_time();

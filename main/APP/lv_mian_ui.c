@@ -629,6 +629,15 @@ void lv_mian_ui(void)
 			lv_obj_set_size(main_ui.mian_inter.ico[ico_num], icon_size, icon_size);
 			lv_obj_set_pos(main_ui.mian_inter.ico[ico_num], x, y);
 			lv_obj_set_style_bg_opa(main_ui.mian_inter.ico[ico_num], LV_OPA_TRANSP, LV_STATE_FOCUSED);
+			lv_obj_set_style_outline_width(main_ui.mian_inter.ico[ico_num], 0, LV_STATE_FOCUSED);
+			lv_obj_set_style_outline_opa(main_ui.mian_inter.ico[ico_num], LV_OPA_TRANSP, LV_STATE_FOCUSED);
+			lv_obj_set_style_border_width(main_ui.mian_inter.ico[ico_num], 0, LV_STATE_FOCUSED);
+			lv_obj_set_style_shadow_width(main_ui.mian_inter.ico[ico_num], 0, LV_STATE_FOCUSED);
+			lv_obj_set_style_bg_opa(main_ui.mian_inter.ico[ico_num], LV_OPA_TRANSP, LV_STATE_FOCUSED | LV_STATE_FOCUS_KEY);
+			lv_obj_set_style_outline_width(main_ui.mian_inter.ico[ico_num], 0, LV_STATE_FOCUSED | LV_STATE_FOCUS_KEY);
+			lv_obj_set_style_outline_opa(main_ui.mian_inter.ico[ico_num], LV_OPA_TRANSP, LV_STATE_FOCUSED | LV_STATE_FOCUS_KEY);
+			lv_obj_set_style_border_width(main_ui.mian_inter.ico[ico_num], 0, LV_STATE_FOCUSED | LV_STATE_FOCUS_KEY);
+			lv_obj_set_style_shadow_width(main_ui.mian_inter.ico[ico_num], 0, LV_STATE_FOCUSED | LV_STATE_FOCUS_KEY);
 			lv_obj_add_event_cb(main_ui.mian_inter.ico[ico_num], lv_imgbtn_control_event_handler, LV_EVENT_ALL, NULL);
 			
 			/* 创建应用名称标签 */

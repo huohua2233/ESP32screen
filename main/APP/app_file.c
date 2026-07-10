@@ -215,9 +215,12 @@ static char *lv_pash_joint(void)
 {
     uint8_t save_prev = (lv_flie.lv_suffix_flag == 1) ? 1 : 0;
     char base_path[FILE_PATH_SIZE];
+    char full_path[FILE_PATH_SIZE];
+    size_t base_length;
     int written;
 
-    if (lv_flie.lv_pash == NULL || lv_flie.lv_pname == NULL || lv_flie.lv_pname[0] == '\0')
+    if (lv_flie.lv_pash == NULL || lv_flie.lv_pname == NULL ||
+        lv_flie.pname == NULL || lv_flie.lv_pname[0] == '\0')
     {
         return NULL;
     }
@@ -227,29 +230,27 @@ static char *lv_pash_joint(void)
     {
         return NULL;
     }
+    base_length = (size_t)written;
 
-    if (save_prev)
-    {
-        if (lv_flie.lv_prev_file_flag >= FILE_PATH_DEPTH)
-        {
-            return NULL;
-        }
-
-        written = snprintf(lv_flie.lv_prev_file[lv_flie.lv_prev_file_flag], FILE_PATH_SIZE, "%s", base_path);
-        if (written < 0 || written >= FILE_PATH_SIZE)
-        {
-            return NULL;
-        }
-
-        lv_flie.lv_prev_file_flag++;
-    }
-
-    written = snprintf(lv_flie.pname, FILE_PATH_SIZE, "%s/%s", base_path, lv_flie.lv_pname);
-    if (written < 0 || written >= FILE_PATH_SIZE)
+    written = snprintf(full_path, sizeof(full_path), "%s/%s", base_path, lv_flie.lv_pname);
+    if (written < 0 || written >= (int)sizeof(full_path))
     {
         return NULL;
     }
 
+    if (save_prev)
+    {
+        if (lv_flie.lv_prev_file_flag < 0 || lv_flie.lv_prev_file_flag >= FILE_PATH_DEPTH ||
+            lv_flie.lv_prev_file[lv_flie.lv_prev_file_flag] == NULL)
+        {
+            return NULL;
+        }
+
+        memcpy(lv_flie.lv_prev_file[lv_flie.lv_prev_file_flag], base_path, base_length + 1);
+        lv_flie.lv_prev_file_flag++;
+    }
+
+    memcpy(lv_flie.pname, full_path, (size_t)written + 1);
     return lv_flie.pname;
 }
 
