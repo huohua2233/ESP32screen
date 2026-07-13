@@ -2,14 +2,11 @@
 
 这是一个面向 ESP32-S3 触摸屏的多功能桌面工程，集成应用启动器、图片与视频播放、计算器、日历、WiFi 时间同步，以及通过蓝牙显示 Windows 端 Codex 和 Claude 运行状态的 AI 状态面板。
 
-本项目基于 [ESP32-S3-LVGL-Board](https://github.com/ConstStrings/ESP32-S3-LVGL-Board) 二次开发，
-适配 ESP32-S3 N16R8 3.5 寸电容触摸屏开发套件。
 
 工程使用 ESP-IDF + LVGL，当前工程名为 `synthesis`，主要功能包括主界面、相册、视频播放、计算器、日历、WiFi、网络时间同步和 AI 状态显示等。
 
 ## 来源说明
 
-- 上游开源项目：[ConstStrings/ESP32-S3-LVGL-Board](https://github.com/ConstStrings/ESP32-S3-LVGL-Board)
 - 适配硬件：慧勤智远 ESP32-S3 N16R8 3.5 寸电容触摸屏开发套件
 - 商品页面：[淘宝商品链接](https://item.taobao.com/item.htm?id=946264202563)
 
