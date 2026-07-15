@@ -16,6 +16,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 
@@ -1319,7 +1320,7 @@ void lv_video_ui(void)
         {
             framebuf = (uint8_t *)malloc(AVI_MAX_FRAME_SIZE);
         }
-        video_favi = (FIL *)malloc(sizeof(FIL));
+        video_favi = (FIL *)calloc(1, sizeof(FIL));
 
         if ((framebuf == NULL) || (video_favi == NULL))
         {

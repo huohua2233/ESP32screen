@@ -56,5 +56,6 @@ typedef struct
 /* 函数声明 */
 void lv_photo_ui(void);
 void lv_pic_del(void);
+void lv_photo_diag_record_boot(void);
 uint16_t pic_get_tnum(char *path);
 #endif

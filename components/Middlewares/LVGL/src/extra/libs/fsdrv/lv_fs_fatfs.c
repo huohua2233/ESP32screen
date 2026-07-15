@@ -149,6 +149,7 @@ static void * fs_open(lv_fs_drv_t * drv, const char * path, lv_fs_mode_t mode)
         lv_fs_fatfs_session_end();
         return NULL;
     }
+    lv_memset_00(f, sizeof(FIL));
 
     if(!lv_fs_fatfs_access_begin()) {
         lv_mem_free(f);
@@ -346,10 +347,9 @@ static lv_fs_res_t fs_dir_read(lv_fs_drv_t * drv, void * dir_p, char * fn)
         }
 
         if(fno.fattrib & AM_DIR) {
-            fn[0] = '/';
-            strcpy(&fn[1], fno.fname);
+            lv_snprintf(fn, LV_FS_MAX_FN_LENGTH, "/%s", fno.fname);
         }
-        else strcpy(fn, fno.fname);
+        else lv_snprintf(fn, LV_FS_MAX_FN_LENGTH, "%s", fno.fname);
 
     } while(strcmp(fn, "/.") == 0 || strcmp(fn, "/..") == 0);
 

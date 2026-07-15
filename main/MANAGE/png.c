@@ -137,7 +137,7 @@
      FRESULT res;
      UINT len;
      uint16_t yield_count = 0;
-     fp = (FIL *)malloc(sizeof(FIL));
+     fp = (FIL *)calloc(1, sizeof(FIL));
      if (fp == NULL)
      {
          return 0;

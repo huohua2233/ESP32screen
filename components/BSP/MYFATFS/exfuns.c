@@ -11,6 +11,7 @@
  */
 
 #include "exfuns.h"
+#include <stdlib.h>
 
 
 #define FILE_MAX_TYPE_NUM       7       /* 最多FILE_MAX_TYPE_NUM个大类 */
@@ -96,23 +97,23 @@ FATFS *fs[FF_VOLUMES];
 uint8_t exfuns_init(void)
 {
     uint8_t i;
-    uint8_t res = 0;
 
     for (i = 0; i < FF_VOLUMES; i++)
     {
-        fs[i] = (FATFS *)malloc(sizeof(FATFS));   /* 为磁盘i工作区申请内存 */
+        if (fs[i] != NULL)
+        {
+            continue;
+        }
 
-        if (!fs[i])break;
+        fs[i] = (FATFS *)calloc(1, sizeof(FATFS));   /* 为磁盘i工作区申请内存 */
+
+        if (fs[i] == NULL)
+        {
+            return 1;
+        }
     }
-    
-    if (i == FF_VOLUMES && res == 0)
-    {
-        return 0;   /* 申请有一个失败,即失败. */
-    }
-    else 
-    {
-        return 1;
-    }
+
+    return 0;
 }
 
 /**
@@ -196,10 +197,18 @@ uint8_t exfuns_file_type(char *fname)
  */
 uint8_t exfuns_get_free(uint8_t *pdrv, uint32_t *total, uint32_t *free)
 {
-    FATFS *fs1;
+    FATFS *fs1 = NULL;
     uint8_t res;
     DWORD fre_clust = 0;
     uint32_t fre_sect = 0, tot_sect = 0;
+
+    if (pdrv == NULL || total == NULL || free == NULL)
+    {
+        return FR_INVALID_PARAMETER;
+    }
+
+    *total = 0;
+    *free = 0;
     
     /* 得到磁盘信息及空闲簇数量 */
     if (!sd_access_begin(portMAX_DELAY))
@@ -207,9 +216,8 @@ uint8_t exfuns_get_free(uint8_t *pdrv, uint32_t *total, uint32_t *free)
         return FR_NOT_READY;
     }
     res = (uint8_t)f_getfree((const TCHAR *)pdrv, &fre_clust, &fs1);
-    sd_access_end();
 
-    if (res == 0)
+    if (res == FR_OK && fs1 != NULL)
     {
         tot_sect = (fs1->n_fatent - 2) * fs1->csize;    /* 得到总扇区数 */
         fre_sect = fre_clust * fs1->csize;              /* 得到空闲扇区数 */
@@ -220,6 +228,12 @@ uint8_t exfuns_get_free(uint8_t *pdrv, uint32_t *total, uint32_t *free)
         *total = tot_sect >> 1;     /* 单位为KB */
         *free = fre_sect >> 1;      /* 单位为KB */
     }
+    else if (res == FR_OK)
+    {
+        res = FR_INT_ERR;
+    }
+
+    sd_access_end();
 
     return res;
 }
@@ -266,8 +280,8 @@ uint8_t exfuns_file_copy(uint8_t(*fcpymsg)(uint8_t *pname, uint8_t pct, uint8_t 
     bool source_open = false;
     bool destination_open = false;
     
-    fsrc = (FIL *)malloc(sizeof(FIL));    /* 申请内存 */
-    fdst = (FIL *)malloc(sizeof(FIL));
+    fsrc = (FIL *)calloc(1, sizeof(FIL));    /* 申请内存 */
+    fdst = (FIL *)calloc(1, sizeof(FIL));
     fbuf = (uint8_t *)malloc(8192);
 
     if (fsrc == NULL || fdst == NULL || fbuf == NULL)

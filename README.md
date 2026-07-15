@@ -1,3 +1,21 @@
+## 免编译烧录
+
+仓库的 `build/idf6/` 目录包含已构建好的 ESP32-S3 固件，无需安装 ESP-IDF 或重新编译即可烧录。Git 会直接跟踪下面 3 个文件，不需要复制到其他目录：
+
+| 文件 | 烧录地址 |
+| --- | ---: |
+| `build/idf6/bootloader/bootloader.bin` | `0x0` |
+| `build/idf6/partition_table/partition-table.bin` | `0x8000` |
+| `build/idf6/synthesis.bin` | `0x10000` |
+
+使用 esptool 时，在工程根目录执行：
+
+```powershell
+esptool --chip esp32s3 --before default-reset --after hard-reset write-flash --flash-mode dio --flash-size 16MB --flash-freq 80m 0x0 build/idf6/bootloader/bootloader.bin 0x8000 build/idf6/partition_table/partition-table.bin 0x10000 build/idf6/synthesis.bin
+```
+
+烧录前请关闭占用串口的程序，并选择正确的 ESP32-S3 串口；烧录完成后设备会自动复位。
+
 # ESP32-S3 3.5寸触摸屏综合工程
 
 这是一个面向 ESP32-S3 触摸屏的多功能桌面工程，集成应用启动器、图片与视频播放、计算器、日历、WiFi 时间同步，以及通过蓝牙显示 Windows 端 Codex 和 Claude 运行状态的 AI 状态面板。
@@ -25,7 +43,7 @@ synthesis/
 ├── components/          # BSP、LVGL、中间件和驱动组件
 ├── main/                # 应用代码
 ├── managed_components/  # ESP-IDF 组件管理器生成目录
-├── build/               # 编译生成目录
+├── build/               # 编译生成目录（Git 仅跟踪 3 个烧录文件）
 ├── tools/               # PC 端 AI 状态 BLE 桥接程序
 ├── sdkconfig            # 当前工程配置
 ├── sdkconfig.defaults   # 关键硬件配置默认值

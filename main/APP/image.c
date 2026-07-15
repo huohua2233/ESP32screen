@@ -13,6 +13,7 @@
 #include "image.h"
 #include "lcd.h"
 #include "ff.h"
+#include <stdlib.h>
 #include <string.h>
 
 /* 图片库区域占用的总扇区数大小 */
@@ -227,7 +228,7 @@ static uint8_t images_update_imagex(uint16_t x, uint16_t y, uint8_t size, uint8_
         return 3;
     }
 
-    fftemp = (FIL *)malloc(sizeof(FIL));  /* 分配内存 */
+    fftemp = (FIL *)calloc(1, sizeof(FIL));  /* 分配内存 */
     tempbuf = malloc(4096);               /* 分配4096个字节空间 */
 
     if (fftemp == NULL || tempbuf == NULL)
@@ -373,7 +374,7 @@ uint8_t images_update_image(uint16_t x, uint16_t y, uint8_t size, uint8_t *src, 
 
     pname = malloc(100);                    /* 申请100字节内存 */
     buf = malloc(4096);                     /* 申请4K字节内存 */
-    fftemp = (FIL *)malloc(sizeof(FIL));    /* 分配内存 */
+    fftemp = (FIL *)calloc(1, sizeof(FIL));    /* 分配内存 */
 
     if (buf == NULL || pname == NULL || fftemp == NULL)
     {

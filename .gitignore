@@ -10,3 +10,17 @@ sdkconfig.old
 *.tmp
 
 .vscode/ipch/
+
+firmware/
+
+!build/
+build/*
+!build/idf6/
+build/idf6/*
+!build/idf6/bootloader/
+build/idf6/bootloader/*
+!build/idf6/bootloader/bootloader.bin
+!build/idf6/partition_table/
+build/idf6/partition_table/*
+!build/idf6/partition_table/partition-table.bin
+!build/idf6/synthesis.bin

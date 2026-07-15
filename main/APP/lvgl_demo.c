@@ -11,6 +11,7 @@
  */
 
 #include "lvgl_demo.h"
+#include "lv_photo_ui.h"
 #include "demos/lv_demos.h"
 #include "spi_sd.h"
 #include "tud_sd.h"
@@ -482,6 +483,7 @@ esp_err_t lvgl_demo(void)
     if (sd_spi_init() == ESP_OK)        /* 初始化TF卡 */
     {
         lv_smail_icon_add_state(TF_STATE);
+        lv_photo_diag_record_boot();
     }
     else
     {

@@ -20,10 +20,51 @@
 #include "esp_rtc.h"
 #include "esp_wifi.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "pc_ai_ble.h"
 #include "tud_sd.h"
 
 static const char *TAG = "APP_MAIN";
+
+static const char *app_reset_reason_name(esp_reset_reason_t reason)
+{
+    switch (reason)
+    {
+        case ESP_RST_POWERON:
+            return "POWERON";
+        case ESP_RST_EXT:
+            return "EXT";
+        case ESP_RST_SW:
+            return "SW";
+        case ESP_RST_PANIC:
+            return "PANIC";
+        case ESP_RST_INT_WDT:
+            return "INT_WDT";
+        case ESP_RST_TASK_WDT:
+            return "TASK_WDT";
+        case ESP_RST_WDT:
+            return "WDT";
+        case ESP_RST_DEEPSLEEP:
+            return "DEEPSLEEP";
+        case ESP_RST_BROWNOUT:
+            return "BROWNOUT";
+        case ESP_RST_SDIO:
+            return "SDIO";
+        case ESP_RST_USB:
+            return "USB";
+        case ESP_RST_JTAG:
+            return "JTAG";
+        case ESP_RST_EFUSE:
+            return "EFUSE";
+        case ESP_RST_PWR_GLITCH:
+            return "PWR_GLITCH";
+        case ESP_RST_CPU_LOCKUP:
+            return "CPU_LOCKUP";
+        case ESP_RST_UNKNOWN:
+        default:
+            return "UNKNOWN";
+    }
+}
 
 
 /**
@@ -34,6 +75,8 @@ static const char *TAG = "APP_MAIN";
 void app_main(void)
 {
     esp_err_t ret;
+    esp_reset_reason_t reset_reason = esp_reset_reason();
+    ESP_LOGI(TAG, "boot reset_reason=%d name=%s", (int)reset_reason, app_reset_reason_name(reset_reason));
     ret = nvs_flash_init();             /* 初始化NVS */
 
     lcd_cfg_t lcd_config_info = {0};

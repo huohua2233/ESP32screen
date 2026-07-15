@@ -19,6 +19,7 @@
  */
 
  #include "jpeg.h"
+ #include <stdlib.h>
 
 
  /* The TJPGD outside the ROM code is newer and has different return type in decode callback */
@@ -145,7 +146,7 @@
          goto err;
      }
      
-     f_jpeg = (FIL *)malloc(sizeof(FIL));
+     f_jpeg = (FIL *)calloc(1, sizeof(FIL));
      if (f_jpeg == NULL)
      {
          ESP_LOGE(__FUNCTION__, "Cannot allocate file handle");

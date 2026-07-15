@@ -11,6 +11,7 @@
  */
 
  #include "bmp.h"
+ #include <stdlib.h>
 
  static uint16_t bmp_read_u16(const uint8_t *data)
  {
@@ -59,7 +60,7 @@
          return 0;
      }
 
-     fp = (FIL *)malloc(sizeof(FIL));
+     fp = (FIL *)calloc(1, sizeof(FIL));
      if (fp == NULL)
      {
          ESP_LOGW(__FUNCTION__, "No memory for file [%s]", filename);
